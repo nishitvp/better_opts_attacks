@@ -1,6 +1,6 @@
 # _May I have your attention?_ Breaking Fine-Tuning based Prompt Injection Defenses using Architecture-Aware Attacks
 
-This repository contains code to run the ASTRA and ASTRA++ attacks that break SecAlign and StruQ. This repository also contains some examples of generated attacks and attack logs
+This repository contains code to run the ASTRA and ASTRA++ attacks that break SecAlign++, SecAlign, StruQ. This repository also contains some examples of generated attacks and attack logs
 
 ## Setup
 
