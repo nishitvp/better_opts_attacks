@@ -14,3 +14,4 @@ fschat
 sentencepiece
 matplotlib
 seaborn
+tqdm
