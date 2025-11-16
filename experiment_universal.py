@@ -214,7 +214,7 @@ if __name__ == "__main__":
             input_convs_formatted = [
                 [
                     {
-                        "role": "system",
+                        "role": "user",
                         "content": x["instruction"]
                     },
                     {
@@ -252,14 +252,14 @@ if __name__ == "__main__":
     gpu_ids = list(range(torch.cuda.device_count()))
 
     models = []
-    for gpu_id in gpu_ids:
-        try:
-            model, tokenizer, frontend_delimiters, _ = secalign.maybe_load_secalign_defended_model(args.model_name, args.defense, device=str(gpu_id), load_model=True, torch_dtype=torch.float16, attn_implementation="eager")
-            model.generation_config.pad_token_id = tokenizer.pad_token_id
-            models.append(model)
-        except Exception as e:
-            traceback.print_exc()
-            raise RuntimeError(f"Can't load model into GPU {gpu_id}")
+    # for gpu_id in gpu_ids:
+    try:
+        model, tokenizer, frontend_delimiters, _ = secalign.maybe_load_secalign_defended_model(args.model_name, args.defense, device="cpu", load_model=True, torch_dtype=torch.float16, attn_implementation="eager")
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        models.append(model)
+    except Exception as e:
+        traceback.print_exc()
+        # raise RuntimeError(f"Can't load model into GPU {gpu_id}")
     logger = experiment_logger.ExperimentLogger(f"{args.expt_folder_prefix}")
     logger.log(training_indices)
     train_on_secalign_dataset(input_convs_formatted, training_indices, models, tokenizer, frontend_delimiters, logger, args.prefix_length, args.suffix_length, args.defense)

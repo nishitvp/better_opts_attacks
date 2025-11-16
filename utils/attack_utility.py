@@ -1256,3 +1256,63 @@ def default_best_universal_choice_function(
     best_output_tokens_dict = all_best_tokens_dicts_list[best_index]
     new_input_tokenized_data_list = update_all_tokens(best_output_tokens_dict, input_tokenized_data_list)
     return new_input_tokenized_data_list
+
+def _cache_init(models, tokenizer, input_tokenized_data_list):
+
+    num_elements_per_batch = len(input_tokenized_data_list) // len(models)
+    input_tokenized_data_list_batches = [input_tokenized_data_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(len(models))]
+
+    _cache_object = []
+    _static_indices = []    
+    for model, input_tokenized_data_list_batch in zip(models, input_tokenized_data_list_batches, strict=True):
+        cache_object_batch = []
+        static_index_batch = []
+        for input_tokenized_data in input_tokenized_data_list_batch:
+            tokens = input_tokenized_data["tokens"]
+            masks_data = input_tokenized_data["masks"]
+            optim_mask = masks_data["optim_mask"]
+            static_index = min(optim_mask) - 1
+            static_tokens = tokens[:static_index]
+            past_key_values = model(input_ids=torch.unsqueeze(static_tokens, dim=0).to(model.device), use_cache=True).past_key_values
+            cache_object_batch.append(past_key_values)
+            static_index_batch.append(static_index)
+        _cache_object.append(cache_object_batch)
+        _static_indices.append(static_index_batch)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    return _cache_object, _static_indices
+
+def _find_single_element_batch_size(model, input_tokenized_data, past_key_values, static_index):
+    with torch.no_grad():
+        tokens = input_tokenized_data["tokens"]
+        batch_size = DEFAULT_MAXIMUM_BATCH_SIZE
+        while batch_size > 1:
+            input_ids_sliced_batch = torch.unsqueeze(tokens, dim=0).expand(batch_size, -1)[:, static_index:]
+            batched_kv_cache = []
+            for keys_cached, values_cached in past_key_values:
+                keys_cached_new = keys_cached.expand(batch_size, -1, -1, -1)
+                values_cached_new = values_cached.expand(batch_size, -1, -1, -1)
+                batched_kv_cache.append((keys_cached_new, values_cached_new))
+            try:
+                dynamic_cache = transformers.DynamicCache.from_legacy_cache(batched_kv_cache)
+                output = model(
+                    input_ids = input_ids_sliced_batch.to(model.device),
+                    past_key_values = dynamic_cache,
+                    output_attentions = True
+                )
+                for pair in batched_kv_cache:
+                    del pair
+                del batched_kv_cache
+                del output, dynamic_cache
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+                break
+            except torch.cuda.OutOfMemoryError:
+                del dynamic_cache, batched_kv_cache
+                gc.collect()
+                torch.cuda.empty_cache()
+                batch_size //= 2
+    
+    return batch_size // 2

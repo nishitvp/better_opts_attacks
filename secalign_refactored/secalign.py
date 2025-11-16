@@ -132,11 +132,17 @@ def maybe_load_secalign_defended_model(model_name, defence, **kwargs):
             load_model = kwargs.pop("load_model", True)
             if not load_model:
                 return None, tokenizer, None, None
+            
+            if device == "cpu":
+                device_str = device
+            else:
+                device_str = "cuda:" + device
+
             base_model = transformers.AutoModelForCausalLM.from_pretrained(base_model_name,
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
                 use_cache=False,
-                device_map="cuda:" + device,
+                device_map=device_str,
                 **kwargs)
             model = PeftModel.from_pretrained(base_model, "secalign_refactored/secalign_models/Meta-SecAlign-8B", is_trainable=False)
             return model, tokenizer, None, None

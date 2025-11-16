@@ -965,65 +965,8 @@ def average_attention_loss_signal(
 class CachedAttentionLoss:
 
     def _cache_init(self, models, tokenizer, input_tokenized_data_list):
+        self.cache_object, self.static_indices = attack_utility._cache_init(models, tokenizer, input_tokenized_data_list)
 
-        num_elements_per_batch = len(input_tokenized_data_list) // len(models)
-        input_tokenized_data_list_batches = [input_tokenized_data_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(len(models))]
-
-        _cache_object = []
-        _static_indices = []    
-        for model, input_tokenized_data_list_batch in zip(models, input_tokenized_data_list_batches, strict=True):
-            cache_object_batch = []
-            static_index_batch = []
-            for input_tokenized_data in input_tokenized_data_list_batch:
-                tokens = input_tokenized_data["tokens"]
-                masks_data = input_tokenized_data["masks"]
-                optim_mask = masks_data["optim_mask"]
-                static_index = min(optim_mask) - 1
-                static_tokens = tokens[:static_index]
-                past_key_values = model(input_ids=torch.unsqueeze(static_tokens, dim=0).to(model.device), use_cache=True).past_key_values
-                cache_object_batch.append(past_key_values)
-                static_index_batch.append(static_index)
-            _cache_object.append(cache_object_batch)
-            _static_indices.append(static_index_batch)
-
-        gc.collect()
-        torch.cuda.empty_cache()        
-        self.cache_object = _cache_object
-        self.static_indices = _static_indices
-
-    def _find_single_element_batch_size(self, model, input_tokenized_data, past_key_values, static_index):
-        with torch.no_grad():
-            tokens = input_tokenized_data["tokens"]
-            batch_size = attack_utility.DEFAULT_MAXIMUM_BATCH_SIZE
-            while batch_size > 1:
-                input_ids_sliced_batch = torch.unsqueeze(tokens, dim=0).expand(batch_size, -1)[:, static_index:]
-                batched_kv_cache = []
-                for keys_cached, values_cached in past_key_values:
-                    keys_cached_new = keys_cached.expand(batch_size, -1, -1, -1)
-                    values_cached_new = values_cached.expand(batch_size, -1, -1, -1)
-                    batched_kv_cache.append((keys_cached_new, values_cached_new))
-                try:
-                    dynamic_cache = transformers.DynamicCache.from_legacy_cache(batched_kv_cache)
-                    output = model(
-                        input_ids = input_ids_sliced_batch.to(model.device),
-                        past_key_values = dynamic_cache,
-                        output_attentions = True
-                    )
-                    for pair in batched_kv_cache:
-                        del pair
-                    del batched_kv_cache
-                    del output, dynamic_cache
-                    torch.cuda.synchronize()
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    break
-                except torch.cuda.OutOfMemoryError:
-                    del dynamic_cache, batched_kv_cache
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    batch_size //= 2
-        
-        return batch_size // 2
 
     def _batch_size_init(self, models, input_tokenized_data_list):
 
@@ -1034,7 +977,7 @@ class CachedAttentionLoss:
         for model, input_tokenized_data_list_batch, cache_object_batch, static_index_batch in zip(models, input_tokenized_data_list_batches, self.cache_object, self.static_indices, strict=True):
             per_device_batch_sizes = []
             for input_tokenized_data, cache_object, static_index in zip(input_tokenized_data_list_batch, cache_object_batch, static_index_batch, strict=True):
-                single_example_batch_size = self._find_single_element_batch_size(model, input_tokenized_data, cache_object, static_index)
+                single_example_batch_size = attack_utility._find_single_element_batch_size(model, input_tokenized_data, cache_object, static_index)
                 per_device_batch_sizes.append(single_example_batch_size)
             _batch_sizes.append(per_device_batch_sizes)
         
@@ -1318,3 +1261,307 @@ class SumOfSensitivitiesLoss:
         results.sort(key = lambda x: x[0])
         
         return torch.cat([result[1] for result in results])
+
+
+def smart_lora_weight_strategy(
+    model,
+    tokenizer,
+    lora_weight_strategy,
+    input_points,
+    masks_data,
+    logger,
+    **kwargs
+):
+    return lora_weight_strategy
+
+
+
+class SingleThreadLoRaTracker:
+
+    def __init__(self, num_points, module_to_track, current_module):
+        self.module_to_track = module_to_track
+        self.current_module = current_module
+        self.expected_len = len(num_points)
+        self.is_live = False
+        self.cache = []
+
+    def __call__(self, module, inputs, outputs):
+        if self.cache:
+            self.state = (inputs, outputs)
+            return
+
+        if len(self.state) >= self.expected_len:
+            raise RuntimeError("Seems like you messed up by not consuming before calling again, you daft idiot.")
+        self.is_live = True
+
+    def consume(self):
+        # Report values saved to be used higher up in the call stack
+        self.is_live = False
+        return self.state
+
+    def reset_state(self):
+        self.is_live = False
+        self.state = []
+    
+    def hard_reset(self):
+        self.reset_state()
+        self.cache = []
+    
+    def cache_current(self):
+        if not self.is_live:
+            raise ValueError("Can only cache if it is live")
+        if not len(self.state) == self.expected_len:
+            raise RuntimeError("Cache called before ensuring that it is fully filled??")
+        self.cache = self.state
+        self.is_live = False
+
+class LoRaLoss:
+
+    def _lora_config_init(self, models,):
+
+        _model: torch.nn.Module = models[0]
+        if (_model.peft_config is None) or len(_model.peft_config) != 1:
+            raise ValueError("Kya kar diya bhai? Pehle ek to kar le ek se zyaada karne se pehle")
+        if not isinstance(list(_model.peft_config.items())[0][1], peft.LoraConfig):
+            raise ValueError("Phir se? Pehle LoRa Lasun kar de")
+        self.lora_key = list(_model.peft_config.items())[0][0]
+        self.lora_config = list(_model.peft_config.items())[0][1]
+
+        _modules_to_hook = []
+        for module_name, module_obj in _model.named_modules():
+            module_hier = module_name.split(".")
+            module_ender = module_hier[-1]
+            if "lora" in module_ender:
+                corr_dict = module_obj
+                if not isinstance(corr_dict, (torch.nn.ModuleDict, torch.nn.ParameterDict)):
+                    raise ValueError("Seems like these things are not dicts???. This should never happen")
+                corr_real_value = corr_dict[self.lora_key]
+                if isinstance(corr_real_value, torch.nn.Parameter):
+                    continue
+                
+                if isinstance(corr_real_value, torch.nn.Module):
+                    if isinstance(corr_real_value, torch.nn.Identity):
+                        continue
+                    if not isinstance(corr_real_value, torch.nn.Linear):
+                        raise ValueError("Lora Modules should by definition be Linear no? Should never come here.")
+                    _modules_to_hook.append(module_name + "." + self.lora_key)
+        self.lora_modules = _modules_to_hook
+
+        all_trackers = []
+        for model, num_points in zip(models, self.current_data_structure):
+            model_tracker_dict = {}
+            for module_to_track in self.lora_modules:
+                current_module = model.get_submodule(module_to_track)
+                module_forward_hook = SingleThreadLoRaTracker(num_points, module_to_track, current_module)
+                current_module.register_forward_hook(module_forward_hook)
+                model_tracker_dict[module_to_track] = module_forward_hook
+            all_trackers.append(model_tracker_dict)
+        self.lora_trackers = all_trackers
+
+    def _cache_init(self, models, tokenizer, input_tokenized_data_list):
+        num_elements_per_batch = len(input_tokenized_data_list) // len(models)
+        input_tokenized_data_list_batches = [input_tokenized_data_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(len(models))]
+
+        _cache_object = []
+        _static_indices = []    
+        for model_idx, model, input_tokenized_data_list_batch in enumerate(zip(models, input_tokenized_data_list_batches, strict=True)):
+            cache_object_batch = []
+            static_index_batch = []
+            for input_tokenized_data in input_tokenized_data_list_batch:
+                tokens = input_tokenized_data["tokens"]
+                masks_data = input_tokenized_data["masks"]
+                optim_mask = masks_data["optim_mask"]
+                static_index = min(optim_mask) - 1
+                static_tokens = tokens[:static_index]
+                past_key_values = model(input_ids=torch.unsqueeze(static_tokens, dim=0).to(model.device), use_cache=True).past_key_values
+                cache_object_batch.append(past_key_values)
+                static_index_batch.append(static_index)
+            for tracker_obj in self.lora_trackers[model_idx].values():
+                tracker_obj.cache_current()
+            _cache_object.append(cache_object_batch)
+            _static_indices.append(static_index_batch)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        return _cache_object, _static_indices
+
+    def _batch_size_init(self, models, input_tokenized_data_list):
+
+        num_elements_per_batch = len(input_tokenized_data_list) // len(models)
+        input_tokenized_data_list_batches = [input_tokenized_data_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(len(models))]
+
+        _batch_sizes = []
+        for model, input_tokenized_data_list_batch, cache_object_batch, static_index_batch in zip(models, input_tokenized_data_list_batches, self.cache_object, self.static_indices, strict=True):
+            per_device_batch_sizes = []
+            for input_tokenized_data, cache_object, static_index in zip(input_tokenized_data_list_batch, cache_object_batch, static_index_batch, strict=True):
+                single_example_batch_size = attack_utility._find_single_element_batch_size(model, input_tokenized_data, cache_object, static_index)
+                per_device_batch_sizes.append(single_example_batch_size)
+            _batch_sizes.append(per_device_batch_sizes)
+        
+        self.batch_sizes = _batch_sizes
+
+    def _input_matches_expected_pattern(self, input_points_list):
+
+        num_elements_per_batch = len(input_points_list) // self.num_models
+        input_points_list_batches = [input_points_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(self.num_models)]
+
+        for batch_idx, input_batch_list in enumerate(input_points_list_batches):
+            try:
+                expected_batch_list = self.current_data_structure[batch_idx]
+            except IndexError:
+                return False
+
+            try:
+                assert len(input_batch_list) == len(expected_batch_list)
+            except AssertionError:
+                return False
+        
+        return True
+
+
+    def _set_current_data_pattern(self, input_points_list):
+        
+        num_elements_per_batch = len(input_points_list) // self.num_models
+        input_points_list_batches = [input_points_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(self.num_models)]
+
+        _current_data_structure = [None] * self.num_models
+
+        for batch_idx, input_point_batch in enumerate(input_points_list_batches):
+            _current_data_structure[batch_idx] = [1] * len(input_point_batch)
+        
+        self.current_data_structure = _current_data_structure
+
+    def __init__(self):
+        self.num_models = None
+        self.current_data_structure = []
+        self.cache_object = []
+        self.batch_sizes = []
+        self.static_indices = []
+
+    def _single_thread_call(
+        self,
+        model,
+        tokenizer,
+        batch_id,
+        input_points_list_batch,
+        masks_data_list_batch,
+        logger,
+        *,
+        dist_metric,
+        lora_weight_strategy,
+        **kwargs,
+    ):
+        ideal_attention_kwargs = kwargs.get("ideal_attentions_kwargs", {})
+        ideal_attention_kwargs.update(kwargs)
+        layer_weight_kwargs = kwargs.get("layer_weight_kwargs", {})
+        layer_weight_kwargs.update(kwargs)
+
+        final_results_list = []
+        for input_points, masks_data, cache_object, static_index, batch_size in zip(input_points_list_batch, masks_data_list_batch, self.cache_object[batch_id], self.static_indices[batch_id], self.batch_sizes[batch_id], strict=True):
+            lora_weight_strategy = smart_lora_weight_strategy(model, tokenizer, lora_weight_strategy, input_points, masks_data, logger)
+            loss_tensors_list = []
+            target_mask = masks_data["target_mask"]
+            num_processed = 0
+            torch.cuda.synchronize(device=model.device)
+            input_points_sliced = input_points[:, static_index:]
+            data_split = torch.split(input_points_sliced, batch_size, dim=0)
+            input_points_losses_list = []
+            for data_batch in data_split:
+                gc.collect()
+                torch.cuda.empty_cache()
+                current_thread_lora_trackers = self.lora_trackers[batch_id]
+                for lora_tracker in current_thread_lora_trackers.values():
+                    lora_tracker.reset()
+                new_legacy_cache = []
+                for key_cache, value_cache in cache_object:
+                    new_legacy_cache.append((key_cache.expand(data_batch.shape[0], -1, -1, -1).clone(), value_cache.expand(data_batch.shape[0], -1, -1, -1).clone()))
+                with torch.no_grad():
+                    loss_contribution = torch.zeros(data_batch.shape[0])
+                    _ = model(input_ids=data_batch.to(model.device), past_key_values=transformers.DynamicCache.from_legacy_cache(new_legacy_cache))
+                    for (module_to_track, lora_tracker) in self.lora_trackers[batch_id]:
+                        loss_contribution += lora_weight_strategy[module_to_track] * dist_metric(lora_tracker.consume()[1])
+                    input_points_losses_list.append(loss_contribution)
+            
+            final_results_list.append(torch.cat(loss_tensors_list).to("cpu"))
+        return final_results_list
+
+    def _reset_lora_hooks(self):
+        for model_tracker_dict in self.lora_trackers:
+            for module_to_track, module_hook in model_tracker_dict:
+                module_hook.reset()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def __call__(self,
+        models,
+        tokenizer,
+        input_points_list,
+        masks_data_list,
+        logger,
+        *,
+        prob_dist_metric,
+        ideal_attentions,
+        layer_weight_strategy,
+        canonical_device_idx = 0,
+        step_num = None,
+        **kwargs             
+    ):
+        if self.num_models is None:
+            self.num_models = len(models)
+        
+        if len(models) != self.num_models:
+            raise ValueError(f"How can you mess up the models parameter? Please do something useful.")
+
+        if not self._input_matches_expected_pattern(input_points_list):
+            self._set_current_data_pattern(input_points_list)
+            self._lora_config_init(models)
+            input_tokenized_data_list = [
+                {
+                    "tokens": input_points[0],
+                    "masks": masks_data
+                }
+                for (input_points, masks_data) in zip(input_points_list, masks_data_list, strict=True)
+            ]
+            self._cache_init(models, tokenizer, input_tokenized_data_list)
+            self._batch_size_init(models, input_tokenized_data_list)
+        
+        num_elements_per_batch = len(input_points_list) // len(models)
+        input_points_list_batches = [input_points_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(len(models))]
+        masks_data_list_batches = [masks_data_list[x * num_elements_per_batch: (x+1) * num_elements_per_batch] for x in range(len(models))]
+
+        self._reset_lora_hooks()
+        results = []
+        with ThreadPoolExecutor(max_workers=len(models)) as executor:
+            future_to_models = [
+                executor.submit(self._single_thread_call,
+                                model,
+                                tokenizer,
+                                batch_id,
+                                input_points_list_batch,
+                                masks_data_list_batch,
+                                logger,
+                                prob_dist_metric=prob_dist_metric,
+                                ideal_attentions=ideal_attentions,
+                                layer_weight_strategy=layer_weight_strategy,
+                                canonical_device_idx=canonical_device_idx,
+                                step_num=step_num,
+                                **kwargs)
+                for batch_id, (model, input_points_list_batch, masks_data_list_batch) in enumerate(zip(models, input_points_list_batches, masks_data_list_batches, strict=True))
+            ]
+
+            torch.cuda.synchronize()
+            for idx, future in enumerate(future_to_models):
+                try:
+                    result = future.result()  # 5 minute timeout
+                    results.append((idx, result))
+                except Exception as exc:
+                    results.append((idx, None))  # or handle differently
+                    raise RuntimeError(f'Model {idx} generated an exception: {exc}')
+
+        results.sort(key = lambda x: x[0])
+        
+        stacked_results = []
+        for _, model_result in results:
+            stacked_results.append(torch.stack(model_result).to(f"cuda:{str(canonical_device_idx)}"))
+        final_stacked_results = torch.cat(stacked_results)
+        return final_stacked_results.mean(dim=0)
