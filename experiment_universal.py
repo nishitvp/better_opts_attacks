@@ -96,19 +96,19 @@ def train_on_secalign_dataset(
                         "topk": 256,
                         "forward_eval_candidates": 512,
                         "substitution_validity_function": filter_function,
-                        "signal_function": losses_experimental.average_attention_loss_signal,
-                        "signal_kwargs": {
-                            "prob_dist_metric": losses_experimental.pointwise_sum_of_differences_payload_only,
-                            "layer_weight_strategy": losses_experimental.DynamicClippedSensitivities(),
-                            "layer_weight_kwargs": {
-                                "quantile": 0.50,
-                            },
-                            "ideal_attentions": losses_experimental.uniform_ideal_attentions,
-                            "ideal_attentions_kwargs": {
-                                "attention_mask_strategy": "payload_only"
-                            }
-                        },
-                        "true_loss_function": losses_experimental.CachedAttentionLoss(),
+                        "signal_function": gcg.universal_rand_gcg_signal,
+                        # "signal_kwargs": {
+                        #     "prob_dist_metric": losses_experimental.pointwise_sum_of_differences_payload_only,
+                        #     "layer_weight_strategy": losses_experimental.DynamicClippedSensitivities(),
+                        #     "layer_weight_kwargs": {
+                        #         "quantile": 0.50,
+                        #     },
+                        #     "ideal_attentions": losses_experimental.uniform_ideal_attentions,
+                        #     "ideal_attentions_kwargs": {
+                        #         "attention_mask_strategy": "payload_only"
+                        #     }
+                        # },
+                        "true_loss_function": losses_experimental.LoRaLoss(),
                         "true_loss_kwargs": {
                             "prob_dist_metric": losses_experimental.pointwise_sum_of_differences_payload_only,
                             "layer_weight_strategy": losses_experimental.DynamicClippedSensitivities(),
@@ -254,7 +254,7 @@ if __name__ == "__main__":
     models = []
     # for gpu_id in gpu_ids:
     try:
-        model, tokenizer, frontend_delimiters, _ = secalign.maybe_load_secalign_defended_model(args.model_name, args.defense, device="cpu", load_model=True, torch_dtype=torch.float16, attn_implementation="eager")
+        model, tokenizer, frontend_delimiters, _ = secalign.maybe_load_secalign_defended_model(args.model_name, args.defense, device="0", load_model=True, torch_dtype=torch.float16, attn_implementation="eager")
         model.generation_config.pad_token_id = tokenizer.pad_token_id
         models.append(model)
     except Exception as e:
