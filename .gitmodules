@@ -10,3 +10,6 @@
 [submodule "other_repos/Meta_SecAlign"]
 	path = other_repos/Meta_SecAlign
 	url = https://github.com/facebookresearch/Meta_SecAlign/
+[submodule "other_repos/rl-injector"]
+	path = other_repos/rl-injector
+	url = https://github.com/facebookresearch/rl-injector.git
