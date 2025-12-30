@@ -17,6 +17,7 @@ import algorithms.gcg as gcg
 from secalign_refactored import secalign, config
 import adversarial_opt
 import algorithms.losses_experimental as losses_experimental
+import algorithms.randomness_experimental as randomness_experimental
 
 @experiment_logger.log_parameters(exclude=["models", "tokenizer"])
 def train_on_secalign_dataset(
@@ -120,6 +121,7 @@ def train_on_secalign_dataset(
                                 "attention_mask_strategy": "payload_only"
                             }
                         },
+                        "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(700, 8, 0.01),
                         "on_step_begin": losses_experimental.DynamicClippedSensitivities.reset_sensitivities,
                         "on_step_begin_kwargs": {
                             "step_frequency": 50,
@@ -155,7 +157,7 @@ def train_on_secalign_dataset(
                 "topk": 256,
                 "forward_eval_candidates": 512,
                 "substitution_validity_function": filter_function,
-
+                "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(700, 8, 0.01),
             },
             "eval_initial": False,
         }
