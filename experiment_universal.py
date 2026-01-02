@@ -121,7 +121,11 @@ def train_on_secalign_dataset(
                                 "attention_mask_strategy": "payload_only"
                             }
                         },
-                        "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(700, 8, 0.01),
+                        "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(
+                            mutation_schedule=[
+                                (700, 8)
+                            ]
+                        ),
                         "on_step_begin": losses_experimental.DynamicClippedSensitivities.reset_sensitivities,
                         "on_step_begin_kwargs": {
                             "step_frequency": 50,
@@ -135,6 +139,7 @@ def train_on_secalign_dataset(
                         "topk": 256,
                         "forward_eval_candidates": 512,
                         "substitution_validity_function": filter_function,
+                        "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(),
                     }
                 }
             ],
@@ -157,7 +162,11 @@ def train_on_secalign_dataset(
                 "topk": 256,
                 "forward_eval_candidates": 512,
                 "substitution_validity_function": filter_function,
-                "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(700, 8, 0.01),
+                "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(
+                    mutation_schedule=[
+                        (700, 8)
+                    ]
+                ),
             },
             "eval_initial": False,
         }
@@ -212,7 +221,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    os.makedirs(f"{args.expt_folder_prefix}/{args.eval_dataset}", exist_ok=True)
     shutil.copy(__file__, args.expt_folder_prefix)
 
     with open("data/alpaca_farm_evaluations.json", "r") as input_prompts_file:
@@ -285,8 +293,8 @@ if __name__ == "__main__":
         raise ValueError("Not recognized eval_dataset.")
 
     for attack_idx, inst_target_pair in enumerate(inst_target_pairs):
-        os.makedirs(f"{args.expt_folder_prefix}/{args.eval_dataset}/example_{str(attack_idx)}", exist_ok=True)
-        logger = experiment_logger.ExperimentLogger(f"{args.expt_folder_prefix}{args.expt_folder_prefix}/{args.eval_dataset}/example_{str(attack_idx)}")
+        os.makedirs(f"{args.expt_folder_prefix}/{args.eval_dataset}_{str(args.training_run)}/example_{str(attack_idx)}", exist_ok=True)
+        logger = experiment_logger.ExperimentLogger(f"{args.expt_folder_prefix}/{args.eval_dataset}_{str(args.training_run)}/example_{str(attack_idx)}")
         logger.log(attack_idx)
         logger.log(inst_target_pair, attack_idx=attack_idx)
         logger.log(training_indices, attack_idx=attack_idx)

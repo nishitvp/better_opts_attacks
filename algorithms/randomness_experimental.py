@@ -20,33 +20,48 @@ import torch
 import math
 
 class AggressiveRandomStrategy:
-    def __init__(self, total_steps, max_mutations, decay_rate):
+    def __init__(self, mutation_schedule=None):
         """
         Args:
-            total_steps: The expected total number of optimization iterations.
-            max_mutations: Maximum number of tokens to flip simultaneously at step 0.
-            decay_rate: How quickly to transition to single-token flips. 
-                        Higher = faster transition to stable refinement.
+            mutation_schedule: list of (num_steps, mutation_count) tuples.
+                Example:
+                    [(200, 8), (200, 6), (200, 4)]
+                After the schedule is exhausted, mutation_count defaults to 1.
         """
-        self.total_steps = total_steps
-        self.max_mutations = max_mutations
-        self.decay_rate = decay_rate
+        self.mutation_schedule = mutation_schedule or []
         self.current_step = 0
 
-    def __call__(self, tokenizer, best_tokens_indices, input_tokenized_data_list, substitution_validity_function, max_candidate_size):
-        # 1. Determine the "Aggression Level" (Mutation Count)
-        # Uses exponential decay: starts at max_mutations, tapers to 1.
-        progress = self.current_step / self.total_steps
-        mutation_count = max(1, round(self.max_mutations * math.exp(-self.decay_rate * progress)))
-        
-        indices_to_sample_batches = [] # List of sets containing (first_coord, second_coord)
+        # Precompute cumulative step boundaries for fast lookup
+        self._schedule_boundaries = []
+        total = 0
+        for steps, mutations in self.mutation_schedule:
+            total += steps
+            self._schedule_boundaries.append((total, mutations))
+
+    def _get_mutation_count(self):
+        """Return mutation count for the current step."""
+        for boundary, mutations in self._schedule_boundaries:
+            if self.current_step < boundary:
+                return mutations
+        return 1  # default fallback
+
+    def __call__(
+        self,
+        tokenizer,
+        best_tokens_indices,
+        input_tokenized_data_list,
+        substitution_validity_function,
+        max_candidate_size,
+    ):
+        # 1. Determine mutation count from schedule
+        mutation_count = self._get_mutation_count()
+
+        indices_to_sample_batches = []  # List[Set[(first_coord, second_coord)]]
 
         # 2. Candidate Generation Loop
         while len(indices_to_sample_batches) < max_candidate_size:
             current_candidate_mutations = set()
-            
-            # Pick 'mutation_count' unique coordinates to flip for this candidate
-            # best_tokens_indices.shape[0] is the length of the optimized prompt segment
+
             attempts = 0
             while len(current_candidate_mutations) < mutation_count and attempts < 100:
                 first_coord = torch.randint(0, best_tokens_indices.shape[0], (1,)).item()
@@ -59,17 +74,20 @@ class AggressiveRandomStrategy:
             for input_tokenized_data in input_tokenized_data_list:
                 masks_data = input_tokenized_data["masks"]
                 optim_mask = masks_data["optim_mask"]
-                
-                # Create a trial version of the tokens with ALL proposed swaps
+
                 trial_tokens = input_tokenized_data["tokens"].clone()
                 for f_coord, s_coord in current_candidate_mutations:
                     trial_tokens[optim_mask[f_coord]] = best_tokens_indices[(f_coord, s_coord)]
 
                 if substitution_validity_function is not None:
-                    if not substitution_validity_function(trial_tokens, tokenizer=tokenizer, masks_data=masks_data):
+                    if not substitution_validity_function(
+                        trial_tokens,
+                        tokenizer=tokenizer,
+                        masks_data=masks_data,
+                    ):
                         all_substitutions_valid = False
                         break
-            
+
             if all_substitutions_valid:
                 indices_to_sample_batches.append(current_candidate_mutations)
 
@@ -79,15 +97,14 @@ class AggressiveRandomStrategy:
             input_new_candidates = []
             masks_data = input_tokenized_data["masks"]
             optim_mask = masks_data["optim_mask"]
-            
+
             for mutation_bundle in indices_to_sample_batches:
                 new_candidate = input_tokenized_data["tokens"].clone()
                 for f_coord, s_coord in mutation_bundle:
                     new_candidate[optim_mask[f_coord]] = best_tokens_indices[(f_coord, s_coord)]
                 input_new_candidates.append(new_candidate)
-                
+
             candidates_list.append(torch.stack(input_new_candidates))
-        
-        # Increment step for the next call
+
         self.current_step += 1
         return candidates_list
