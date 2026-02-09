@@ -123,7 +123,9 @@ def train_on_secalign_dataset(
                         },
                         "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(
                             mutation_schedule=[
-                                (700, 8)
+                                (200, 8),
+                                (200, 6),
+                                (200, 4)
                             ]
                         ),
                         "on_step_begin": losses_experimental.DynamicClippedSensitivities.reset_sensitivities,
@@ -164,7 +166,9 @@ def train_on_secalign_dataset(
                 "substitution_validity_function": filter_function,
                 "randomness_strategy": randomness_experimental.AggressiveRandomStrategy(
                     mutation_schedule=[
-                        (700, 8)
+                        (200, 8),
+                        (200, 6),
+                        (200, 4)
                     ]
                 ),
             },
