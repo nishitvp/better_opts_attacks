@@ -216,9 +216,10 @@ class HarmonyFormatter:
                 tool_name = msg.get("name", "unknown")
                 if not tool_name.startswith("functions."):
                     tool_name = f"functions.{tool_name}"
+                text = self._harmony_content_to_text(content)
                 harmony_msgs.append(
                     Message.from_author_and_content(
-                        Author.new(Role.TOOL, tool_name), content,
+                        Author.new(Role.TOOL, tool_name), text,
                     ).with_channel("commentary")
                 )
 
@@ -290,6 +291,28 @@ class HarmonyFormatter:
 
     # ── Parsing ─────────────────────────────────────────────────────
 
+    def _harmony_content_to_text(self, content) -> str:
+        if isinstance(content, str):
+            return content
+
+        # Common Harmony case: content is a list like [TextContent(text="...")]
+        if isinstance(content, (list, tuple)):
+            parts = []
+            for part in content:
+                text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+                else:
+                    parts.append(str(part))
+            return "".join(parts)
+
+        text = getattr(content, "text", None)
+        if isinstance(text, str):
+            return text
+
+        return str(content)
+
+
     def parse_generation(
         self, generated_token_ids: List[int], call_id_prefix: str = "call",
     ) -> HarmonyGeneration:
@@ -322,35 +345,49 @@ class HarmonyFormatter:
 
         for msg in parsed:
             channel = getattr(msg, "channel", None)
-            content = getattr(msg, "content", "")
             recipient = getattr(msg, "recipient", None)
-            if hasattr(content, "text"):
-                content = content.text
-            elif not isinstance(content, str):
-                content = str(content)
+            content = self._harmony_content_to_text(getattr(msg, "content", None))
 
-            if channel == "analysis":
-                result.analysis_text = (result.analysis_text + "\n" + content) if result.analysis_text else content
-            elif channel == "commentary" and recipient:
+            # In Harmony, recipient is the right signal for a tool call.
+            if channel == "commentary" and recipient:
                 func_name = recipient.removeprefix("functions.")
                 try:
-                    args = json.loads(content) if content else {}
+                    args = json.loads(content) if content.strip() else {}
                 except json.JSONDecodeError:
                     args = {"_raw": content}
+
                 call_counter += 1
-                result.tool_calls.append(HarmonyToolCall(
-                    function_name=func_name, arguments=args,
-                    raw_recipient=recipient, id=f"{call_id_prefix}_{call_counter}",
-                ))
+                result.tool_calls.append(
+                    HarmonyToolCall(
+                        function_name=func_name,
+                        arguments=args,
+                        raw_recipient=recipient,
+                        id=f"{call_id_prefix}_{call_counter}",
+                    )
+                )
+
+            elif channel == "analysis":
+                if content:
+                    result.analysis_text = (
+                        result.analysis_text + "\n" + content
+                        if result.analysis_text else content
+                    )
+
             elif channel == "commentary":
-                result.commentary_text = content
+                if content:
+                    result.commentary_text = (
+                        result.commentary_text + "\n" + content
+                        if result.commentary_text else content
+                    )
+
             elif channel == "final":
-                result.final_text = content
-            elif content:
-                result.final_text = content
-
+                if content:
+                    result.final_text = (
+                        result.final_text + "\n" + content
+                        if result.final_text else content
+                    )
+    
         return result
-
     # ── Message helpers ─────────────────────────────────────────────
     # These produce the dicts that _to_conversation() expects.
     # They match what AgentDojo's pipeline elements produce.

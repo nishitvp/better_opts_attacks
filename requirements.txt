@@ -15,3 +15,8 @@ sentencepiece
 matplotlib
 seaborn
 tqdm
+agentdojo
+openai
+openai-harmony
+triton==3.4
+kernels

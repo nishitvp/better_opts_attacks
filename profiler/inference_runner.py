@@ -71,7 +71,8 @@ def chat_messages_to_dicts(messages: Sequence[ChatMessage]) -> List[Dict[str, An
             result.append({"role": "user", "content": text})
 
         elif role == "assistant":
-            text = get_text_content_as_str(msg["content"])
+            if msg["content"] is not None:
+                text = get_text_content_as_str(msg["content"])
             tool_calls = msg.get("tool_calls")
             if tool_calls:
                 for tc in tool_calls:
@@ -121,7 +122,7 @@ class LocalHarmonyLLM(BasePipelineElement):
         logger.info("Loading model: %s", model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype, device_map=device, **model_kwargs,
+            model_name, device_map=device, **model_kwargs,
         )
         self.model.eval()
 
@@ -192,8 +193,6 @@ class LocalHarmonyLLM(BasePipelineElement):
 
     def _generation_to_chat_message(self, gen) -> ChatAssistantMessage:
         """Convert HarmonyGeneration → AgentDojo ChatAssistantMessage."""
-        content_text = gen.final_text or ""
-
         tool_calls = None
         if gen.has_tool_calls:
             tool_calls = [
@@ -204,15 +203,18 @@ class LocalHarmonyLLM(BasePipelineElement):
                 )
                 for tc in gen.tool_calls
             ]
+            # Tool call turns have no content (matches OpenAI API behavior)
+            content = None
+        else:
+            content = [{"type": "text", "content": gen.final_text or ""}]
 
         return ChatAssistantMessage(
             role="assistant",
-            content=[{"type": "text", "text": content_text}],
+            content=content,
             tool_calls=tool_calls,
         )
-
+    
     # ── Profiling pass (called after pipeline completes) ────────────
-
     def run_profiling_pass(
         self,
         messages: Sequence[ChatMessage],
