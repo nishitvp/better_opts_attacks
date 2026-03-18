@@ -173,7 +173,7 @@ def test_functional(model_name: str, suite_name: str, task_ids: List[str], devic
             results.append({
                 "task_id": task_id, "utility": utility,
                 "tool_turns": turns, "tool_calls": tools,
-                "has_response": bool(final),
+                "has_response": bool(final), "messages": messages
             })
 
         except Exception as e:
@@ -211,22 +211,20 @@ def main():
     )
     for name in ["transformers", "torch"]:
         logging.getLogger(name).setLevel(logging.WARNING)
+    
+    for suite_name in ["workspace", "banking", "travel", "slack"]:
+        suite = get_suite(VERSION, suite_name)
+        task_ids = args.tasks or list(suite.user_tasks.keys())
+        print("=" * 70)
+        print(f"Suite: {suite_name}, Tasks: {len(task_ids)}")
 
-    suite = get_suite(VERSION, args.suite)
-    task_ids = args.tasks or list(suite.user_tasks.keys())
-    print(f"Suite: {args.suite}, Tasks: {len(task_ids)}")
+        rendering_ok = test_token_rendering(args.model, suite_name, task_ids)
+        results = test_functional(args.model, suite_name, task_ids, args.device)
 
-    # rendering_ok = test_token_rendering(args.model, args.suite, task_ids)
-
-    # if args.rendering_only:
-    #     sys.exit(0 if rendering_ok else 1)
-
-    results = test_functional(args.model, args.suite, task_ids, args.device)
-
-    Path("verification_results.json").write_text(
-        json.dumps({"functional": results}, indent=2, default=str)
-    )
-    print("\nSaved to verification_results.json")
+        Path(f"verification_results_{suite_name}.json").write_text(
+            json.dumps({"rendering_ok": rendering_ok, "functional": results}, indent=2, default=str)
+        )
+        print(f"\nSaved to verification_results_{suite_name}.json")
 
 
 if __name__ == "__main__":
