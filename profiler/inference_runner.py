@@ -51,6 +51,7 @@ DEFAULT_SYSTEM_MESSAGE = (
 
 # ── ChatMessage conversion (used by both LLM element and verification) ──
 
+
 def chat_messages_to_dicts(messages: Sequence[ChatMessage]) -> List[Dict[str, Any]]:
     """Convert AgentDojo ChatMessage TypedDicts to simple dicts for harmony rendering.
 
@@ -91,7 +92,6 @@ def chat_messages_to_dicts(messages: Sequence[ChatMessage]) -> List[Dict[str, An
 
     return result
 
-
 # ── Local LLM as BasePipelineElement ────────────────────────────────────
 
 class LocalHarmonyLLM(BasePipelineElement):
@@ -122,7 +122,7 @@ class LocalHarmonyLLM(BasePipelineElement):
         logger.info("Loading model: %s", model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map=device, **model_kwargs,
+            model_name, torch_dtype="auto", device_map=device, **model_kwargs,
         )
         self.model.eval()
 
@@ -213,8 +213,8 @@ class LocalHarmonyLLM(BasePipelineElement):
             content=content,
             tool_calls=tool_calls,
         )
-    
     # ── Profiling pass (called after pipeline completes) ────────────
+
     def run_profiling_pass(
         self,
         messages: Sequence[ChatMessage],
@@ -327,6 +327,8 @@ def run_task(
 
     We add only: profiling passes after execution.
     """
+    import copy
+
     t0 = time.time()
 
     suite = get_suite(version, suite_name)
@@ -336,33 +338,39 @@ def run_task(
     # Inject attack into environment
     defaults = suite.get_injection_vector_defaults()
     injections = {v: attack_string for v in defaults}
-    env = suite.load_and_inject_default_environment(injections=injections)
+    env = suite.load_and_inject_default_environment(injections)
+    if hasattr(user_task, "init_environment"):
+        env = user_task.init_environment(env)
+
+    # Deepcopy before pipeline mutates env (needed for evaluation)
+    original_env = copy.deepcopy(env)
 
     runtime = FunctionsRuntime(suite.tools)
-    user_prompt = user_task.prompt if hasattr(user_task, "prompt") else str(user_task)
+    user_prompt = user_task.PROMPT
 
     # Clear LLM call log for this task
     llm.call_log.clear()
 
     # Run the pipeline — AgentDojo handles everything
-    _, _, env, messages, _ = pipeline.query(user_prompt, runtime, env)
+    _, _, post_env, messages, _ = pipeline.query(user_prompt, runtime, env)
 
-    # Extract final response from last assistant message
+    # Extract final response from last non-tool-call assistant message
     final_response = ""
     for msg in reversed(messages):
-        if msg["role"] == "assistant":
-            final_response = get_text_content_as_str(msg["content"])
+        if msg["role"] == "assistant" and not msg.get("tool_calls"):
+            if msg["content"] is not None:
+                final_response = get_text_content_as_str(msg["content"])
             break
 
-    # Evaluate via AgentDojo
+    # Evaluate via AgentDojo — utility(final, original_env, post_env)
     evaluation = {}
     try:
-        evaluation["utility"] = user_task.utility(env, final_response)
+        evaluation["utility"] = user_task.utility(final_response, original_env, post_env)
     except Exception as e:
         evaluation["utility"] = None
         evaluation["utility_error"] = str(e)
     try:
-        sec = injection_task.security(env, final_response)
+        sec = injection_task.security(final_response, original_env, post_env)
         evaluation["security"] = sec
         evaluation["injection_success"] = not sec
     except Exception as e:
@@ -377,8 +385,8 @@ def run_task(
     if profile_steps != "none" and transcript:
         steps = _resolve_profile_steps(profile_steps, transcript)
         for step in steps:
-            step_msgs = [m for m in messages
-                         if messages.index(m) <= _msg_cutoff_for_step(messages, step)]
+            cutoff = _msg_cutoff_for_step(messages, step)
+            step_msgs = messages[:cutoff + 1]
             feats = llm.run_profiling_pass(step_msgs, runtime, transcript, step, attack_string)
             for f in feats:
                 f["step"] = step
