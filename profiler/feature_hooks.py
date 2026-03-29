@@ -102,6 +102,8 @@ class CapturedFeatures:
     # Shape: (seq_len, vocab_size) or (num_positions, vocab_size)
     logit_lens: Dict[int, torch.Tensor] = field(default_factory=dict)
 
+    sink_mass: Dict[int, torch.Tensor] = field(default_factory=dict)
+
     def clear(self):
         self.attention.clear()
         self.hidden_states.clear()
@@ -225,52 +227,43 @@ class FeatureCapture:
     # ── Hook factories ──────────────────────────────────────────────
 
     def _make_attention_hook(self, layer_idx: int):
-        """Create a forward hook that captures attention weights."""
         config = self.config
         features = self.features
 
         def hook_fn(module, input, output):
-            # HuggingFace attention modules return:
-            #   (attn_output, attn_weights, past_key_value)
-            # when output_attentions=True. But with hooks, we may need
-            # to extract from the module directly.
             attn_weights = None
-
-            # Try to get from output tuple
             if isinstance(output, tuple) and len(output) >= 2:
                 candidate = output[1]
                 if isinstance(candidate, torch.Tensor) and candidate.dim() >= 3:
                     attn_weights = candidate
 
             if attn_weights is None:
-                # Some models store attention weights as a module attribute
-                # during forward (e.g., module._attn_weights)
                 for attr in ["_attn_weights", "attn_weights", "attention_weights"]:
                     if hasattr(module, attr):
                         attn_weights = getattr(module, attr)
                         break
 
             if attn_weights is None:
-                logger.debug("Layer %d: attention weights not available in hook output", layer_idx)
                 return
 
-            # attn_weights shape: (batch, num_heads, seq_len, seq_len)
-            # Remove batch dim (we process one sequence at a time)
             if attn_weights.dim() == 4:
-                attn_weights = attn_weights[0]  # (num_heads, seq_len, seq_len)
+                attn_weights = attn_weights[0]
 
+            # Compute per-head sink mass: 1 - sum(real_attention_weights)
+            # This is the probability mass that went to the learned sink scalar
             if config.attention_last_row_only:
-                # Only keep the last row: what the last token attends to
-                # Shape: (num_heads, seq_len)
+                sink_mass = 1.0 - attn_weights[:, -1, :].sum(dim=-1)  # (num_heads,)
                 attn_weights = attn_weights[:, -1, :]
+            else:
+                sink_mass = 1.0 - attn_weights.sum(dim=-1)  # (num_heads, seq_len)
 
             if config.capture_positions is not None:
-                # Only keep specific positions
                 if attn_weights.dim() == 3:
                     attn_weights = attn_weights[:, config.capture_positions, :]
-                # For last_row_only, all positions are in the seq_len dim (kept)
+                    sink_mass = sink_mass[:, config.capture_positions]
 
             features.attention[layer_idx] = attn_weights.to(config.storage_device).detach()
+            features.sink_mass[layer_idx] = sink_mass.to(config.storage_device).detach()
 
         return hook_fn
 

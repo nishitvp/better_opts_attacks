@@ -40,6 +40,7 @@ from harmony_format import (
     HarmonyFormatter, STOP_TOKEN_IDS, agentdojo_tools_to_descriptions,
 )
 from feature_hooks import FeatureCapture, FeatureConfig
+from conversation_tagger import tag_conversation                        # ← ADDED
 
 logger = logging.getLogger(__name__)
 
@@ -213,70 +214,6 @@ class LocalHarmonyLLM(BasePipelineElement):
             content=content,
             tool_calls=tool_calls,
         )
-    # ── Profiling pass (called after pipeline completes) ────────────
-
-    def run_profiling_pass(
-        self,
-        messages: Sequence[ChatMessage],
-        runtime: FunctionsRuntime,
-        transcript: ConversationTranscript,
-        step: int,
-        attack_string: str = "",
-    ) -> List[Dict[str, Any]]:
-        """Run a post-hoc forward pass at a specific step to capture features.
-
-        Called AFTER the pipeline completes, not during.
-        """
-        simple_msgs = chat_messages_to_dicts(messages)
-        tool_descs = agentdojo_tools_to_descriptions(runtime)
-        tok = self.formatter.tokenize_with_spans(simple_msgs, tool_descs)
-
-        input_ids = torch.tensor([tok.token_ids], device=self.device)
-        self.model.eval()
-        with torch.no_grad(), self.feature_capture.active():
-            self.model(input_ids=input_ids, output_attentions=True)
-
-        # Build span groups from transcript metadata + fresh tokenization
-        span_groups = self._build_span_groups(transcript, step, tok, attack_string)
-        return self.feature_capture.extract_scalar_features(span_groups, len(tok.token_ids))
-
-    def _build_span_groups(self, transcript, step, tok, attack_string):
-        groups = {"system": [], "user": [], "assistant": [],
-                  "tool_clean": [], "tool_injected": [], "payload": []}
-        step_msgs = [m for m in transcript.messages if m.step <= step]
-        n = len(tok.content_spans)
-
-        # Harmony inserts system+developer from our single system message
-        has_dev = n > len(step_msgs)
-        if has_dev and n >= 2:
-            groups["system"].extend(tok.content_spans[:2])
-            offset, start_idx = 2, 1
-        elif n >= 1:
-            groups["system"].append(tok.content_spans[0])
-            offset, start_idx = 1, 1
-        else:
-            return groups
-
-        for i, msg in enumerate(step_msgs[start_idx:], start=start_idx):
-            si = offset + (i - start_idx)
-            if si >= n:
-                break
-            span = tok.content_spans[si]
-            if msg.role == "user":
-                groups["user"].append(span)
-            elif msg.role == "assistant":
-                groups["assistant"].append(span)
-            elif msg.role == "tool":
-                if msg.contains_injection:
-                    groups["tool_injected"].append(span)
-                    if attack_string:
-                        inj = self.formatter.find_injection_token_span(
-                            tok.token_ids, span[0], span[1], attack_string)
-                        if inj:
-                            groups["payload"].append(inj)
-                else:
-                    groups["tool_clean"].append(span)
-        return groups
 
 
 # ── Pipeline builder ────────────────────────────────────────────────────
@@ -303,9 +240,11 @@ class TaskResult:
     final_response: str = ""
     evaluation: Dict[str, Any] = field(default_factory=dict)
     transcript: Optional[ConversationTranscript] = None
-    features: List[Dict[str, Any]] = field(default_factory=list)
     wall_time: float = 0.0
     call_log: List[Dict[str, Any]] = field(default_factory=list)
+    # Preserved so profiling.py can use them downstream
+    runtime: Optional[FunctionsRuntime] = None
+    attack_string: str = ""
 
 
 def run_task(
@@ -372,7 +311,7 @@ def run_task(
     try:
         sec = injection_task.security(final_response, original_env, post_env)
         evaluation["security"] = sec
-        evaluation["injection_success"] = not sec
+        evaluation["injection_success"] = sec
     except Exception as e:
         evaluation["security"] = None
         evaluation["security_error"] = str(e)
@@ -380,26 +319,15 @@ def run_task(
     # Build transcript for profiling (from the messages AgentDojo produced)
     transcript = _build_transcript_from_messages(messages, llm, runtime, attack_string)
 
-    # Profiling passes
-    features = []
-    if profile_steps != "none" and transcript:
-        steps = _resolve_profile_steps(profile_steps, transcript)
-        for step in steps:
-            cutoff = _msg_cutoff_for_step(messages, step)
-            step_msgs = messages[:cutoff + 1]
-            feats = llm.run_profiling_pass(step_msgs, runtime, transcript, step, attack_string)
-            for f in feats:
-                f["step"] = step
-            features.extend(feats)
-
     return TaskResult(
         messages=list(messages),
         final_response=final_response,
         evaluation=evaluation,
         transcript=transcript,
-        features=features,
         wall_time=time.time() - t0,
         call_log=list(llm.call_log),
+        runtime=runtime,
+        attack_string=attack_string,
     )
 
 
@@ -450,20 +378,19 @@ def _build_transcript_from_messages(
         role = msg["role"]
 
         if role == "tool":
-            contains_inj = attack_string and attack_string in msg.get("content", "")
             inj_span = None
-            if contains_inj:
+            if attack_string:
                 inj_span = llm.formatter.find_injection_token_span(
                     tok.token_ids, span[0], span[1], attack_string)
-            step += 1  # tool results advance the step
+            step += 1
             transcript.add_message(
                 role="tool", text=msg.get("content", ""),
                 token_start=span[0], token_end=span[1], step=step,
                 tool_name=msg.get("name"),
-                contains_injection=contains_inj,
+                contains_injection=inj_span is not None,
                 injection_token_start=inj_span[0] if inj_span else None,
                 injection_token_end=inj_span[1] if inj_span else None,
-            )
+            ) 
         elif role == "assistant":
             transcript.add_message(
                 role="assistant", text=msg.get("content", ""),
@@ -476,24 +403,3 @@ def _build_transcript_from_messages(
             )
 
     return transcript
-
-
-def _resolve_profile_steps(profile_steps, transcript):
-    if profile_steps == "critical":
-        cs = transcript.critical_step()
-        return [cs] if cs is not None else []
-    if profile_steps == "all":
-        return list(range(transcript.num_steps))
-    if isinstance(profile_steps, list):
-        return [s for s in profile_steps if s < transcript.num_steps]
-    return []
-
-
-def _msg_cutoff_for_step(messages, step):
-    tool_count = 0
-    for i, msg in enumerate(messages):
-        if msg["role"] == "tool":
-            tool_count += 1
-            if tool_count > step:
-                return i
-    return len(messages) - 1

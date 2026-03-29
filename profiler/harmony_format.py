@@ -19,6 +19,7 @@ Dependencies: pip install openai-harmony
 from __future__ import annotations
 
 import json
+import re
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -433,29 +434,98 @@ class HarmonyFormatter:
     # ── Injection span detection ────────────────────────────────────
 
     def find_injection_token_span(
-        self, full_token_ids: List[int],
-        content_start: int, content_end: int,
-        attack_string: str,
-    ) -> Optional[Tuple[int, int]]:
-        """Find attack_string within a content span. Exact match first, char-ratio fallback."""
-        attack_ids = self.tokenizer.encode(attack_string, add_special_tokens=False)
-        content_ids = full_token_ids[content_start:content_end]
+            self, full_token_ids: List[int],
+            content_start: int, content_end: int,
+            attack_string: str,
+        ) -> Optional[Tuple[int, int]]:
+            """Find attack_string within a content span by incremental decode."""
+            content_ids = full_token_ids[content_start:content_end]
+            if not content_ids:
+                return None
 
-        # Exact subsequence
-        for i in range(len(content_ids) - len(attack_ids) + 1):
-            if content_ids[i:i + len(attack_ids)] == attack_ids:
-                return (content_start + i, content_start + i + len(attack_ids))
+            # Exact token subsequence (fast path)
+            attack_ids = self.tokenizer.encode(attack_string, add_special_tokens=False)
+            for i in range(len(content_ids) - len(attack_ids) + 1):
+                if content_ids[i:i + len(attack_ids)] == attack_ids:
+                    return (content_start + i, content_start + i + len(attack_ids))
 
-        # Character-ratio fallback
-        content_text = self.tokenizer.decode(content_ids, skip_special_tokens=True)
-        pos = content_text.find(attack_string)
-        if pos >= 0:
-            ratio = pos / max(len(content_text), 1)
-            est_start = content_start + int(ratio * len(content_ids))
-            est_len = max(1, int(len(attack_string) / max(len(content_text), 1) * len(content_ids)))
-            return (est_start, min(est_start + est_len, content_end))
+            # Build char_offset → token_index map by decoding one token at a time
+            # tok_char_start[i] = character offset where token i begins in decoded text
+            pieces = []
+            tok_char_start = []
+            char_cursor = 0
+            for tok_id in content_ids:
+                piece = self.tokenizer.decode([tok_id], skip_special_tokens=True)
+                tok_char_start.append(char_cursor)
+                pieces.append(piece)
+                char_cursor += len(piece)
 
-        return None
+            content_text = "".join(pieces)
+            total_chars = char_cursor
+
+            def char_to_tok(char_pos):
+                """Character offset → first token that starts at or after that position."""
+                for i, start in enumerate(tok_char_start):
+                    if start + len(pieces[i]) > char_pos:
+                        return i
+                return len(content_ids)
+
+            def char_to_tok_end(char_pos):
+                """Character offset → first token AFTER the one containing char_pos."""
+                for i, start in enumerate(tok_char_start):
+                    if start + len(pieces[i]) >= char_pos:
+                        return i + 1
+                return len(content_ids)
+
+            # Try 1: exact substring match
+            pos = content_text.find(attack_string)
+            if pos >= 0:
+                tok_s = char_to_tok(pos)
+                tok_e = char_to_tok_end(pos + len(attack_string))
+                return (content_start + tok_s, content_start + tok_e)
+
+            # Try 2: whitespace-normalized match (handles YAML line-wrapping)
+            import re
+            norm_content = re.sub(r'\\[ntr]\s*', ' ', content_text)
+            norm_content = re.sub(r'\s+', ' ', norm_content)
+            norm_attack = re.sub(r'\s+', ' ', attack_string)
+
+            norm_pos = norm_content.find(norm_attack)
+            if norm_pos >= 0:
+                # Map normalized char offsets back to original char offsets
+                # by walking original text and tracking how normalization compressed it
+                norm_i = 0
+                orig_start = None
+                orig_end = None
+                oi = 0
+                while oi < len(content_text) and norm_i < len(norm_content):
+                    if orig_start is None and norm_i == norm_pos:
+                        orig_start = oi
+                    if orig_start is not None and norm_i == norm_pos + len(norm_attack):
+                        orig_end = oi
+                        break
+                    # Check if we're at a sequence that got normalized
+                    m = re.match(r'\\[ntr]\s*', content_text[oi:])
+                    if m:
+                        oi += m.end()
+                        norm_i += 1  # became a single space in norm_content
+                    elif content_text[oi].isspace():
+                        # Consecutive whitespace collapsed to one space
+                        while oi < len(content_text) and content_text[oi].isspace():
+                            oi += 1
+                        norm_i += 1
+                    else:
+                        oi += 1
+                        norm_i += 1
+
+                if orig_start is not None:
+                    if orig_end is None:
+                        orig_end = len(content_text)
+                    tok_s = char_to_tok(orig_start)
+                    tok_e = char_to_tok_end(orig_end)
+                    return (content_start + tok_s, content_start + tok_e)
+
+            return None
 
     def decode(self, token_ids: List[int], skip_special: bool = True) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special)
