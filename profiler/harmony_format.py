@@ -488,7 +488,8 @@ class HarmonyFormatter:
             import re
             norm_content = re.sub(r'\\[ntr]\s*', ' ', content_text)
             norm_content = re.sub(r'\s+', ' ', norm_content)
-            norm_attack = re.sub(r'\s+', ' ', attack_string)
+            norm_attack = re.sub(r'\\[ntr]\s*', ' ', attack_string)
+            norm_attack = re.sub(r'\s+', ' ', norm_attack)
 
             norm_pos = norm_content.find(norm_attack)
             if norm_pos >= 0:
@@ -511,6 +512,110 @@ class HarmonyFormatter:
                         norm_i += 1  # became a single space in norm_content
                     elif content_text[oi].isspace():
                         # Consecutive whitespace collapsed to one space
+                        while oi < len(content_text) and content_text[oi].isspace():
+                            oi += 1
+                        norm_i += 1
+                    else:
+                        oi += 1
+                        norm_i += 1
+
+                if orig_start is not None:
+                    if orig_end is None:
+                        orig_end = len(content_text)
+                    tok_s = char_to_tok(orig_start)
+                    tok_e = char_to_tok_end(orig_end)
+                    return (content_start + tok_s, content_start + tok_e)
+
+            # Try 3: YAML single-quoted scalar unescape + whitespace normalize.
+            # When a payload ends up as a YAML single-quoted scalar value, every
+            # literal ' is escaped as '' (e.g. {'password': 'x'} becomes
+            # {''password'': ''x''}).  The whitespace normalization above does not
+            # undo this, so we add a dedicated pass that replaces '' → ' in the
+            # content before searching, then maps the match back to original char
+            # offsets (each '' in the original → 1 char in the normalised string).
+            ue_content = re.sub(r"''", "'", content_text)
+            ue_content = re.sub(r'\\[ntr]\s*', ' ', ue_content)
+            ue_content = re.sub(r'\s+', ' ', ue_content)
+            # attack_string uses real single quotes, so only whitespace norm needed
+            ue_attack = re.sub(r'\\[ntr]\s*', ' ', attack_string)
+            ue_attack = re.sub(r'\s+', ' ', ue_attack)
+
+            ue_pos = ue_content.find(ue_attack)
+            if ue_pos >= 0:
+                norm_i = 0
+                orig_start = None
+                orig_end = None
+                oi = 0
+                while oi < len(content_text) and norm_i < len(ue_content):
+                    if orig_start is None and norm_i == ue_pos:
+                        orig_start = oi
+                    if orig_start is not None and norm_i == ue_pos + len(ue_attack):
+                        orig_end = oi
+                        break
+                    # YAML '' → ' (two original chars become one in ue_content)
+                    if content_text[oi:oi + 2] == "''":
+                        oi += 2
+                        norm_i += 1
+                    # Literal escape sequences collapsed to one space
+                    elif re.match(r'\\[ntr]\s*', content_text[oi:]):
+                        m2 = re.match(r'\\[ntr]\s*', content_text[oi:])
+                        oi += m2.end()
+                        norm_i += 1
+                    # Consecutive whitespace collapsed to one space
+                    elif content_text[oi].isspace():
+                        while oi < len(content_text) and content_text[oi].isspace():
+                            oi += 1
+                        norm_i += 1
+                    else:
+                        oi += 1
+                        norm_i += 1
+
+                if orig_start is not None:
+                    if orig_end is None:
+                        orig_end = len(content_text)
+                    tok_s = char_to_tok(orig_start)
+                    tok_e = char_to_tok_end(orig_end)
+                    return (content_start + tok_s, content_start + tok_e)
+
+            # Try 4: Python-repr backslash-escaped single quotes (\' → ').
+            # When tool content is serialised as repr() of a Python dict, single
+            # quotes inside string values are escaped as \' rather than '' (the
+            # YAML form Try 3 handles).  E.g. "it's" → "it\'s".  We unescape
+            # \' → ' then do the same parallel walk to recover original offsets.
+            #
+            # Note: newlines in the original payload may be double-escaped (\\n,
+            # two backslashes + n) after repr-inside-YAML serialisation.  We use
+            # \\+[ntr] (one or more backslashes before n/t/r) to collapse them all
+            # to a single space, same as the single-escape case.
+            bs_content = re.sub(r"\\'", "'", content_text)
+            bs_content = re.sub(r'\\+[ntr]\s*', ' ', bs_content)
+            bs_content = re.sub(r'\s+', ' ', bs_content)
+            bs_attack = re.sub(r'\\[ntr]\s*', ' ', attack_string)
+            bs_attack = re.sub(r'\s+', ' ', bs_attack)
+
+            bs_pos = bs_content.find(bs_attack)
+            if bs_pos >= 0:
+                norm_i = 0
+                orig_start = None
+                orig_end = None
+                oi = 0
+                while oi < len(content_text) and norm_i < len(bs_content):
+                    if orig_start is None and norm_i == bs_pos:
+                        orig_start = oi
+                    if orig_start is not None and norm_i == bs_pos + len(bs_attack):
+                        orig_end = oi
+                        break
+                    # \' → ' (two original chars become one in bs_content)
+                    if content_text[oi:oi + 2] == "\\'":
+                        oi += 2
+                        norm_i += 1
+                    # One or more backslashes before n/t/r collapsed to one space
+                    elif re.match(r'\\+[ntr]\s*', content_text[oi:]):
+                        m2 = re.match(r'\\+[ntr]\s*', content_text[oi:])
+                        oi += m2.end()
+                        norm_i += 1
+                    # Consecutive whitespace collapsed to one space
+                    elif content_text[oi].isspace():
                         while oi < len(content_text) and content_text[oi].isspace():
                             oi += 1
                         norm_i += 1

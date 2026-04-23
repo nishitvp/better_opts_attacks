@@ -138,14 +138,17 @@ class ExperimentLogger:
         This configures WAL mode on the main connection which propagates to all future connections.
         """
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        
-        # CRITICAL: Must fetch the result for WAL mode to take effect
-        result = conn.execute('PRAGMA journal_mode=WAL').fetchone()
-        if result[0] != 'wal':
-            raise RuntimeError(f"Failed to enable WAL mode, got: {result[0]}")
-        
-        # Set synchronous mode for better performance with WAL
-        conn.execute('PRAGMA synchronous=NORMAL')
+
+        # Use DELETE journal mode (rollback journal) instead of WAL.
+        # WAL checkpointing can corrupt the DB header if the process is killed
+        # mid-checkpoint, leaving B-tree pages prepended before the SQLite magic.
+        # DELETE mode writes atomically to the main file — safer for long-running
+        # single-writer experiments.
+        result = conn.execute('PRAGMA journal_mode=DELETE').fetchone()
+        if result[0] != 'delete':
+            raise RuntimeError(f"Failed to set journal_mode=DELETE, got: {result[0]}")
+
+        conn.execute('PRAGMA synchronous=FULL')
         
         # Create schema
         conn.execute("""
@@ -198,14 +201,7 @@ class ExperimentLogger:
                 check_same_thread=False  # We manage thread safety ourselves
             )
             
-            # WAL mode is already set on the database file from _init_database
-            # But we still need to verify and set other pragmas for this connection
-            result = conn.execute('PRAGMA journal_mode').fetchone()
-            if result[0] != 'wal':
-                # Force WAL if not set (shouldn't happen, but defensive)
-                conn.execute('PRAGMA journal_mode=WAL').fetchone()
-            
-            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA synchronous=FULL')
             conn.execute('PRAGMA busy_timeout=30000')
             
             self._connections[key] = conn

@@ -37,6 +37,7 @@ from harmony_format import (
     TOKEN_CONSTRAIN,
     TOKEN_RETURN,
     TOKEN_CALL,
+    HARMONY_SPECIAL_IDS,
     TERMINAL_TOKENS,
 )
 
@@ -151,6 +152,101 @@ class TaggedConversation:
     def injection_steps(self) -> List[int]:
         """Steps that contain attack_payload tokens."""
         return sorted({s["step"] for s in self.spans if s["tag"] == "attack_payload"})
+
+# ── Tag raw generation tokens (NEW) ────────────────────────────────────
+
+def tag_gen_tokens(
+    formatter: HarmonyFormatter,
+    gen_token_ids: List[int],
+    offset: int = 0,
+    step: int = 0,
+) -> Tuple[List[Optional[str]], List[dict]]:
+    """Tag generated tokens (including reasoning) by harmony structure."""
+    seq_len = len(gen_token_ids)
+    if seq_len == 0:
+        return [], []
+
+    tags: List[Optional[str]] = [None] * seq_len
+    spans: List[dict] = []
+
+    i = 0
+    while i < seq_len:
+        tid = gen_token_ids[i]
+
+        if tid == TOKEN_CHANNEL:
+            _fill(tags, spans, i + offset, i + 1 + offset,
+                  "frame_channel", -1, step, "assistant", None)
+
+            j = i + 1
+            while j < seq_len and gen_token_ids[j] not in HARMONY_SPECIAL_IDS:
+                j += 1
+            channel_name = formatter.tokenizer.decode(
+                gen_token_ids[i + 1:j], skip_special_tokens=True
+            ).strip()
+
+            if i + 1 < j:
+                _fill(tags, spans, i + 1 + offset, j + offset,
+                      "frame_channel_name", -1, step, "assistant", channel_name)
+
+            has_constrain = False
+            content_start = j
+            if j < seq_len and gen_token_ids[j] == TOKEN_CONSTRAIN:
+                has_constrain = True
+                _fill(tags, spans, j + offset, j + 1 + offset,
+                      "frame_constrain", -1, step, "assistant", channel_name)
+                k = j + 1
+                while k < seq_len and gen_token_ids[k] not in HARMONY_SPECIAL_IDS:
+                    k += 1
+                if j + 1 < k:
+                    _fill(tags, spans, j + 1 + offset, k + offset,
+                          "frame_constrain_type", -1, step, "assistant", channel_name)
+                content_start = k
+
+            if content_start < seq_len and gen_token_ids[content_start] == TOKEN_MESSAGE:
+                _fill(tags, spans, content_start + offset, content_start + 1 + offset,
+                      "frame_message", -1, step, "assistant", channel_name)
+                content_start += 1
+
+            content_end = content_start
+            while content_end < seq_len:
+                t = gen_token_ids[content_end]
+                if t == TOKEN_CHANNEL or t in TERMINAL_TOKENS:
+                    break
+                content_end += 1
+
+            if content_start < content_end:
+                content_tag = _channel_to_content_tag(channel_name, has_constrain)
+                _fill(tags, spans, content_start + offset, content_end + offset,
+                      content_tag, -1, step, "assistant", channel_name)
+
+            i = content_end
+            continue
+
+        elif tid in _SPECIAL_TO_TAG:
+            _fill(tags, spans, i + offset, i + 1 + offset,
+                  _SPECIAL_TO_TAG[tid], -1, step, "assistant", None)
+            i += 1
+
+        else:
+            group_start = i
+            while i < seq_len and gen_token_ids[i] not in HARMONY_SPECIAL_IDS:
+                i += 1
+            _fill(tags, spans, group_start + offset, i + offset,
+                  "frame_metadata", -1, step, "assistant", None)
+
+    return tags, spans
+
+
+def _channel_to_content_tag(channel_name: str, has_constrain: bool) -> str:
+    if channel_name == "analysis":
+        return "assistant_reasoning"
+    elif channel_name == "commentary":
+        return "assistant_tool_call" if has_constrain else "assistant_commentary"
+    elif channel_name == "final":
+        return "assistant_final"
+    else:
+        return "assistant_commentary"
+
 
 
 # ── Main entry point ───────────────────────────────────────────────────

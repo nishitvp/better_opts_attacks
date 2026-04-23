@@ -175,3 +175,4 @@ secalign_refactored/secalign_models/*
 gpt-oss_refactored/gpt-oss_models/*
 .local
 .hf
+profiler/*logs*

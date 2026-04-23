@@ -315,40 +315,19 @@ def main():
             print(f"    ✗ Failed: {e}")
             traceback.print_exc()
 
-    # ── Test 3: Sanity checks ──────────────────────────────────────
+    # ── Test 3: Intermediate attention ─────────────────────────────
     print("\n" + "=" * 70)
-    print("  Test 3: Sanity checks")
+    print("  Test 3: Intermediate attention (tool-call query positions)")
     print("=" * 70)
 
     if task_results:
         label, result = next(iter(task_results.items()))
         print(f"\n  Using {label}:")
         try:
-            test_sanity(llm, result, result.attack_string)
+            test_intermediate_attention(llm, result, result.attack_string)
         except Exception as e:
             print(f"    ✗ Failed: {e}")
             traceback.print_exc()
-
-    # ── Test 4: Perturbation comparison ────────────────────────────
-    print("\n" + "=" * 70)
-    print("  Test 4: Perturbation comparison")
-    print("=" * 70)
-
-    if task_results:
-        label, result = next(iter(task_results.items()))
-        print(f"\n  Using {label}:")
-        test_intermediate_attention(llm, result, result.attack_string)
-
-    try:
-        test_perturbation(
-            llm, pipeline,
-            args.suite, args.user_task, args.injection_task,
-            ATTACK_STRINGS[1],
-            n_perturbations=args.n_perturbations,
-        )
-    except Exception as e:
-        print(f"    ✗ Failed: {e}")
-        traceback.print_exc()
 
     # ── Summary ────────────────────────────────────────────────────
     print("\n" + "=" * 70)

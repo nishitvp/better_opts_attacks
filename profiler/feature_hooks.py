@@ -66,7 +66,9 @@ class FeatureConfig:
     # Feature types to capture
     capture_attention: bool = True       # per-head attention weights
     capture_hidden_states: bool = True   # residual stream at each profiled layer
-    capture_logit_lens: bool = False     # project hidden states through lm_head
+    capture_logit_lens: bool = False     # project hidden states through lm_head (top-k)
+    capture_value_aggregates: bool = False  # sum_i(alpha_i * v_i) per head before o_proj
+    capture_mlp_output: bool = False        # MLP/MoE contribution to residual stream
 
     # For attention, capture only the last row (attention pattern for the
     # last token, which is what drives generation). Saves memory.
@@ -78,6 +80,9 @@ class FeatureConfig:
 
     # Device for stored tensors (cpu to save GPU memory)
     storage_device: str = "cpu"
+
+    # Number of top tokens to store for logit lens (per position per layer)
+    logit_lens_top_k: int = 50
 
     def should_capture_layer(self, layer_idx: int) -> bool:
         if self.layers is None:
@@ -91,23 +96,40 @@ class CapturedFeatures:
 
     # Attention weights: {layer_idx: tensor}
     # Shape per tensor: (num_heads, seq_len) if last_row_only
-    #                   (num_heads, seq_len, seq_len) otherwise
+    #                   (num_heads, num_positions, seq_len) if capture_positions set
     attention: Dict[int, torch.Tensor] = field(default_factory=dict)
 
-    # Hidden states at each profiled layer: {layer_idx: tensor}
+    # Hidden states (residual stream output) at each profiled layer: {layer_idx: tensor}
     # Shape: (seq_len, hidden_dim) or (num_positions, hidden_dim)
     hidden_states: Dict[int, torch.Tensor] = field(default_factory=dict)
 
-    # Logit lens projections: {layer_idx: tensor}
-    # Shape: (seq_len, vocab_size) or (num_positions, vocab_size)
-    logit_lens: Dict[int, torch.Tensor] = field(default_factory=dict)
+    # Logit lens: top-k projections of hidden states through lm_head.
+    # Populated by compute_logit_lens() after the forward pass.
+    # {layer_idx: {"top_tokens": (num_positions, k), "top_logits": (num_positions, k)}}
+    logit_lens: Dict[int, Dict[str, torch.Tensor]] = field(default_factory=dict)
 
+    # Attention sink mass: probability mass that did NOT go to any real key position
+    # (model-specific learned sink scalar). {layer_idx: tensor}
+    # Shape: (num_heads,) if last_row_only, (num_heads, num_positions) otherwise
     sink_mass: Dict[int, torch.Tensor] = field(default_factory=dict)
+
+    # Value aggregates: sum_i(alpha_i * v_i) for each head, before the output
+    # projection. Captures WHAT information is retrieved, not just WHERE.
+    # {layer_idx: tensor}, shape: (num_positions, hidden_dim)
+    # Reshape to (num_positions, num_heads, head_dim) in analysis.
+    value_aggregates: Dict[int, torch.Tensor] = field(default_factory=dict)
+
+    # MLP (or MoE block) contribution to residual stream: {layer_idx: tensor}
+    # Shape: (num_positions, hidden_dim)
+    mlp_outputs: Dict[int, torch.Tensor] = field(default_factory=dict)
 
     def clear(self):
         self.attention.clear()
         self.hidden_states.clear()
         self.logit_lens.clear()
+        self.sink_mass.clear()
+        self.value_aggregates.clear()
+        self.mlp_outputs.clear()
 
 
 class FeatureCapture:
@@ -171,6 +193,20 @@ class FeatureCapture:
                 return getattr(layer, name)
         return None
 
+    def _find_o_proj(self, attn_module: nn.Module) -> Optional[nn.Module]:
+        """Find the output projection within an attention module."""
+        for name in ["o_proj", "out_proj", "dense"]:
+            if hasattr(attn_module, name):
+                return getattr(attn_module, name)
+        return None
+
+    def _find_mlp_module(self, layer: nn.Module) -> Optional[nn.Module]:
+        """Find the MLP/MoE sub-module within a layer."""
+        for name in ["mlp", "block_sparse_moe", "moe", "ff", "ffn", "feed_forward"]:
+            if hasattr(layer, name):
+                return getattr(layer, name)
+        return None
+
     # ── Hook registration ───────────────────────────────────────────
 
     def register_hooks(self):
@@ -182,16 +218,39 @@ class FeatureCapture:
             if not self.config.should_capture_layer(layer_idx):
                 continue
 
-            # Attention hook
-            if self.config.capture_attention:
-                attn_module = self._find_attn_module(layer_module)
-                if attn_module is not None:
-                    hook = attn_module.register_forward_hook(
-                        self._make_attention_hook(layer_idx)
+            attn_module = self._find_attn_module(layer_module)
+
+            # Attention weights hook
+            if self.config.capture_attention and attn_module is not None:
+                hook = attn_module.register_forward_hook(
+                    self._make_attention_hook(layer_idx)
+                )
+                self._hooks.append(hook)
+
+            # Value aggregate hook: pre-hook on o_proj captures its input,
+            # which is the concatenated per-head value aggregates sum_i(alpha_i v_i)
+            if self.config.capture_value_aggregates and attn_module is not None:
+                o_proj = self._find_o_proj(attn_module)
+                if o_proj is not None:
+                    hook = o_proj.register_forward_pre_hook(
+                        self._make_value_aggregate_hook(layer_idx)
                     )
                     self._hooks.append(hook)
+                else:
+                    logger.warning("Layer %d: no o_proj found, skipping value aggregates", layer_idx)
 
-            # Hidden state hook (on the full layer output = residual stream)
+            # MLP/MoE output hook
+            if self.config.capture_mlp_output:
+                mlp_module = self._find_mlp_module(layer_module)
+                if mlp_module is not None:
+                    hook = mlp_module.register_forward_hook(
+                        self._make_mlp_hook(layer_idx)
+                    )
+                    self._hooks.append(hook)
+                else:
+                    logger.warning("Layer %d: no MLP module found, skipping mlp_output", layer_idx)
+
+            # Hidden state hook (full layer output = residual stream after attn+mlp)
             if self.config.capture_hidden_states:
                 hook = layer_module.register_forward_hook(
                     self._make_hidden_state_hook(layer_idx)
@@ -287,6 +346,51 @@ class FeatureCapture:
 
         return hook_fn
 
+    def _make_value_aggregate_hook(self, layer_idx: int):
+        """Create a pre-hook on o_proj that captures the value aggregate.
+
+        The input to o_proj is the concatenated per-head outputs:
+            sum_i(alpha_i * v_i) for each head, reshaped to (batch, seq_len, hidden_dim).
+        This is WHAT gets written to the residual stream per head, before the output
+        projection mixes heads together.
+        Shape stored: (num_positions, hidden_dim) — reshape to (num_positions, num_heads,
+        head_dim) in analysis using num_heads from the attention tensor.
+        """
+        config = self.config
+        features = self.features
+
+        def pre_hook_fn(module, args):
+            x = args[0]  # (batch, seq_len, hidden_dim)
+            if x.dim() == 3:
+                x = x[0]  # (seq_len, hidden_dim)
+            if config.capture_positions is not None:
+                x = x[config.capture_positions]  # (num_positions, hidden_dim)
+            features.value_aggregates[layer_idx] = x.to(config.storage_device).detach()
+
+        return pre_hook_fn
+
+    def _make_mlp_hook(self, layer_idx: int):
+        """Create a forward hook that captures the MLP/MoE contribution to the residual stream.
+
+        This is the additive contribution from the feed-forward sublayer, separate from
+        the attention sublayer's contribution. JailbreakLens (2024) found MLP contributions
+        are the primary driver of jailbreak amplification, not attention routing.
+        Shape stored: (num_positions, hidden_dim).
+        """
+        config = self.config
+        features = self.features
+
+        def hook_fn(module, input, output):
+            # MoE output may be (hidden_states, router_logits) or just hidden_states
+            mlp_out = output[0] if isinstance(output, tuple) else output
+            if mlp_out.dim() == 3:
+                mlp_out = mlp_out[0]  # (seq_len, hidden_dim)
+            if config.capture_positions is not None:
+                mlp_out = mlp_out[config.capture_positions]
+            features.mlp_outputs[layer_idx] = mlp_out.to(config.storage_device).detach()
+
+        return hook_fn
+
     # ── Feature computation ─────────────────────────────────────────
 
     def compute_attention_mass(
@@ -354,51 +458,45 @@ class FeatureCapture:
         self,
         lm_head: nn.Module,
         layer_norm: Optional[nn.Module] = None,
-        top_k: int = 10,
-    ) -> Dict[int, Dict[str, Any]]:
-        """
-        Project intermediate hidden states through the LM head (logit lens).
+        top_k: int = 50,
+    ) -> Dict[int, Dict[str, torch.Tensor]]:
+        """Project intermediate hidden states through the LM head (logit lens).
 
-        For each captured layer, applies the final layer norm (if provided)
-        and the LM head to see what tokens the model "believes" at that layer.
+        For each captured layer and each captured position, applies the final
+        layer norm (if provided) and the LM head. Reveals when, layer by layer,
+        the model's working prediction commits to injection-task vs user-task tokens.
 
         Args:
-            lm_head:    The model's output projection (model.lm_head)
-            layer_norm: The final layer norm (model.model.norm), applied before
-                        the lm_head. If None, projects raw hidden states.
-            top_k:      Number of top tokens to return per layer.
+            lm_head:    The model's output projection (model.lm_head).
+            layer_norm: The final layer norm (model.model.norm). Applied before
+                        lm_head. If None, projects raw hidden states.
+            top_k:      Number of top tokens to store per position per layer.
 
         Returns:
             {layer_idx: {
-                "top_tokens": tensor(top_k),       # token IDs
-                "top_probs": tensor(top_k),         # probabilities
-                "target_probs": dict                # filled in by caller if needed
+                "top_tokens": tensor(num_positions, top_k),   # token IDs
+                "top_logits": tensor(num_positions, top_k),   # raw logits (not probs)
             }}
+        Raw logits are stored rather than probabilities so callers can compute
+        gaps/differences between specific token IDs without softmax distortion.
         """
         if not self.features.hidden_states:
             logger.warning("No hidden states captured. Run a forward pass first.")
             return {}
 
+        lm_device = next(lm_head.parameters()).device
         results = {}
         with torch.no_grad():
             for layer_idx, hidden in self.features.hidden_states.items():
-                # hidden: (seq_len, hidden_dim) or (num_positions, hidden_dim)
-                # Take the last position (what generates the next token)
-                h = hidden[-1:]  # (1, hidden_dim)
-                h = h.to(next(lm_head.parameters()).device)
-
+                # hidden: (num_positions, hidden_dim) after position filtering
+                h = hidden.to(lm_device)
                 if layer_norm is not None:
                     h = layer_norm(h)
-
-                logits = lm_head(h)  # (1, vocab_size)
-                probs = torch.softmax(logits[0], dim=-1)
-
-                top_probs, top_ids = probs.topk(top_k)
-
+                logits = lm_head(h)  # (num_positions, vocab_size)
+                top_logits, top_ids = logits.topk(top_k, dim=-1)
                 results[layer_idx] = {
                     "top_tokens": top_ids.cpu(),
-                    "top_probs": top_probs.cpu(),
-                    "full_probs": probs.cpu(),  # for target_prob lookup
+                    "top_logits": top_logits.cpu(),
                 }
 
         return results

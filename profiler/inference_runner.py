@@ -44,10 +44,7 @@ from conversation_tagger import tag_conversation                        # ← AD
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SYSTEM_MESSAGE = (
-    "You are a helpful assistant with access to a set of tools. "
-    "You can use these tools to help answer the user's questions."
-)
+DEFAULT_SYSTEM_MESSAGE = ""
 
 
 # ── ChatMessage conversion (used by both LLM element and verification) ──
@@ -163,6 +160,8 @@ class LocalHarmonyLLM(BasePipelineElement):
         self.call_log.append({
             "prompt_tokens": len(token_ids),
             "gen_tokens": len(gen_ids),
+            "prompt_token_ids": list(token_ids),
+            "gen_token_ids": list(gen_ids),
             "tool_calls": [
                 {"name": tc.function_name, "args": tc.arguments}
                 for tc in gen.tool_calls
