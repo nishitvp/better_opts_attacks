@@ -126,6 +126,7 @@ def custom_gcg(
     substitution_validity_function = custom_gcg_hyperparams.get("substitution_validity_function", None)
     signal_kwargs = custom_gcg_hyperparams.get("signal_kwargs", None)
     true_loss_kwargs = custom_gcg_hyperparams.get("true_loss_kwargs", None)
+    trajectory_metrics_fn = custom_gcg_hyperparams.get("trajectory_metrics_fn", None)
 
     current_best_tokens = input_tokens.clone()
     best_output_sequences = []
@@ -147,6 +148,9 @@ def custom_gcg(
         generated_output_tokens = model.generate(torch.unsqueeze(current_best_tokens[eval_input_mask], dim=0).to(model.device), attention_mask=torch.unsqueeze(torch.ones(current_best_tokens[eval_input_mask].shape), dim=0).to(model.device), **generation_config)
         generated_output_string = tokenizer.batch_decode(generated_output_tokens[:, eval_input_mask[-1] + 1 :])[0]
         logger.log(generated_output_string, step_num=-1)
+        if trajectory_metrics_fn is not None:
+            initial_trajectory_metrics = trajectory_metrics_fn(model, tokenizer, current_best_tokens, masks_data, logger)
+            logger.log(initial_trajectory_metrics, step_num=-1)
 
     step_num = 0
 
@@ -157,6 +161,7 @@ def custom_gcg(
     current_best_tokens_chunk = []
     logprobs_chunk = []
     generated_output_string_chunk = []
+    trajectory_metrics_chunk = []
 
     for step_num in range(custom_gcg_hyperparams["max_steps"]):
         
@@ -212,7 +217,11 @@ def custom_gcg(
         logprobs = target_logprobs(model, tokenizer, torch.unsqueeze(current_best_tokens, 0), masks_data, input_tokens[target_mask], logger)
         logprobs = logprobs.item()
         logprobs_chunk.append(logprobs)
-        logprobs_sequences.append(logprobs)        
+        logprobs_sequences.append(logprobs)
+        if trajectory_metrics_fn is not None:
+            trajectory_metrics_chunk.append(
+                trajectory_metrics_fn(model, tokenizer, current_best_tokens, masks_data, logger)
+            )
         if eval_every_step:
             generated_output_tokens = model.generate(torch.unsqueeze(current_best_tokens[eval_input_mask], dim=0).to(model.device), attention_mask=torch.unsqueeze(torch.ones(current_best_tokens[eval_input_mask].shape), dim=0).to(model.device), **generation_config)
             generated_output_string = tokenizer.batch_decode(generated_output_tokens[:, eval_input_mask[-1] + 1 :])[0]
@@ -233,6 +242,9 @@ def custom_gcg(
             logger.log(best_tokens_chunk, step_num=step_num)
             logger.log(logprobs_chunk, step_num=step_num)
             logger.log(generated_output_string_chunk, step_num=step_num)
+            if trajectory_metrics_fn is not None:
+                logger.log(trajectory_metrics_chunk, step_num=step_num)
+                trajectory_metrics_chunk = []
 
             substitution_data_chunk = []
             true_losses_chunk = []
@@ -375,6 +387,7 @@ def weakly_universal_gcg(
     signal_kwargs = universal_gcg_hyperparameters.get("signal_kwargs", None)
     true_loss_kwargs = universal_gcg_hyperparameters.get("true_loss_kwargs", None)
     randomness_strategy = universal_gcg_hyperparameters.get("randomness_strategy", DEFAULT_GCG_RANDOMNESS_STRATEGY)
+    trajectory_metrics_fn = universal_gcg_hyperparameters.get("trajectory_metrics_fn", None)
 
     on_step_begin = universal_gcg_hyperparameters.get("on_step_begin", DEFAULT_ON_STEP)
     on_step_begin_kwargs = universal_gcg_hyperparameters.get("on_step_begin_kwargs", {})
@@ -403,7 +416,7 @@ def weakly_universal_gcg(
     true_losses_chunk = []
     current_best_true_loss_chunk = []
     logprobs_chunk = []
-
+    trajectory_metrics_chunk = []
 
     current_input_tokenized_data_list = input_tokenized_data_list
     for step_num in range(universal_gcg_hyperparameters["max_steps"]):
@@ -427,12 +440,21 @@ def weakly_universal_gcg(
         logprobs_chunk.append(average_logprobs.item())
         average_logprobs_list.append(average_logprobs.item())
         current_input_tokenized_data_list = attack_utility.update_all_tokens(best_tokens_dict, current_input_tokenized_data_list)
+        if trajectory_metrics_fn is not None:
+            # Use first context as representative; models[0] for the forward pass
+            rep = current_input_tokenized_data_list[0]
+            trajectory_metrics_chunk.append(
+                trajectory_metrics_fn(models[0], tokenizer, rep["tokens"], rep["masks"], logger)
+            )
 
         if (step_num + 1) % 10 == 0:
             logger.log(true_losses_chunk, step_num=step_num)
             logger.log(current_best_true_loss_chunk, step_num=step_num)
             logger.log(best_tokens_dicts_chunk, step_num=step_num)
             logger.log(logprobs_chunk, step_num=step_num)
+            if trajectory_metrics_fn is not None:
+                logger.log(trajectory_metrics_chunk, step_num=step_num)
+                trajectory_metrics_chunk = []
 
             true_losses_chunk = []
             current_best_true_loss_chunk = []

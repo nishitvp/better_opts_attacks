@@ -176,3 +176,4 @@ gpt-oss_refactored/gpt-oss_models/*
 .local
 .hf
 profiler/*logs*
+*.pid

@@ -509,12 +509,19 @@ def capture_forward_pass(
         "seq_len"          — int
     Keys with no data (disabled in config or hook not found) hold empty dicts.
     """
+    import time as _time
     capture = FeatureCapture(model, feature_config)
     input_tensor = torch.tensor([token_ids], device=device)
     model.eval()
 
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    _t0 = _time.time()
     with torch.no_grad(), capture.active() as features:
         model(input_ids=input_tensor, output_attentions=True)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    logger.debug("capture_forward_pass: seq_len=%d  gpu_time=%.2fs", len(token_ids), _time.time() - _t0)
 
     result = {
         "attention":        dict(features.attention),

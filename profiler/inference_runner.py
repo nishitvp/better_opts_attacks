@@ -131,6 +131,18 @@ class LocalHarmonyLLM(BasePipelineElement):
         # Accumulated profiling data across pipeline calls
         self.call_log: List[Dict[str, Any]] = []
 
+        # Prefix KV cache — single-use per run_task() call.
+        # _prefix_cache_ids_ref: the stored prefix (set once per context, kept across runs).
+        # _prefix_cache_ids:     the "armed" copy (cleared after first hit; restored by
+        #                        rearm_prefix_cache() before each run_task()).
+        # This prevents the cache from being applied to later generate() calls within the
+        # same pipeline run (calls 2+ see a longer context and should not use the cache).
+        self._prefix_cache_ids_ref: Optional[List[int]] = None
+        self._prefix_cache_ids: Optional[List[int]] = None
+        self._prefix_cache_kv = None  # DynamicCache on GPU
+        self._prefix_cache_hits: int = 0
+        self._prefix_cache_misses: int = 0
+
     def query(
         self,
         query: str,
@@ -178,9 +190,65 @@ class LocalHarmonyLLM(BasePipelineElement):
 
         return query, runtime, env, messages, extra_args
 
+    # ── Prefix KV cache management ───────────────────────────────────
+
+    def set_prefix_cache(self, prefix_ids: List[int], past_key_values) -> None:
+        """Store a KV prefix cache for this context.
+
+        The cache is SINGLE-USE per run_task() call: _prefix_cache_ids is cleared
+        (disarmed) after the first generate() hit, preventing the cache from being
+        applied to later calls in the same pipeline run (calls 2+ have a longer
+        context and must not use a stale prefix cache — doing so causes divergence).
+
+        Call rearm_prefix_cache() immediately before each run_task() to re-enable
+        the cache for that call only.
+        """
+        self._prefix_cache_ids_ref = list(prefix_ids)
+        self._prefix_cache_ids = list(prefix_ids)   # armed for first use
+        self._prefix_cache_kv = past_key_values
+        self._prefix_cache_hits = 0
+        self._prefix_cache_misses = 0
+        n_layers = len(getattr(past_key_values, "layers", []))
+        seq_len = past_key_values.get_seq_length() if hasattr(past_key_values, "get_seq_length") else "?"
+        logger.info("Prefix KV cache set: %d prefix tokens, %d layers, seq_len=%s",
+                    len(prefix_ids), n_layers, seq_len)
+
+    def rearm_prefix_cache(self) -> None:
+        """Re-arm the cache for the next run_task() call.
+
+        Must be called immediately before each run_task() so the cache applies to
+        only the FIRST matching generate() call in that pipeline run.
+        """
+        if self._prefix_cache_ids_ref is not None:
+            self._prefix_cache_ids = list(self._prefix_cache_ids_ref)
+
+    def clear_prefix_cache(self) -> None:
+        if self._prefix_cache_ids_ref is not None:
+            logger.info("Prefix KV cache cleared: %d hits, %d misses",
+                        self._prefix_cache_hits, self._prefix_cache_misses)
+        self._prefix_cache_ids_ref = None
+        self._prefix_cache_ids = None
+        self._prefix_cache_kv = None
+
     # ── Internal ────────────────────────────────────────────────────
 
     def _generate(self, prompt_ids: List[int]) -> List[int]:
+        # Check for an armed prefix cache match.  Disarms itself after first hit so
+        # subsequent calls in the same run_task() use standard (uncached) generation.
+        if self._prefix_cache_ids is not None:
+            n = len(self._prefix_cache_ids)
+            if (len(prompt_ids) > n
+                    and list(prompt_ids[:n]) == self._prefix_cache_ids):
+                self._prefix_cache_hits += 1
+                self._prefix_cache_ids = None  # disarm: only cache first hit per run
+                logger.debug("_generate: cache HIT (prompt_len=%d, prefix_len=%d)",
+                             len(prompt_ids), n)
+                return self._generate_from_cache(prompt_ids)
+            logger.debug("_generate: cache MISS (prompt_len=%d, prefix_len=%d, match=%s)",
+                         len(prompt_ids), n,
+                         "too_short" if len(prompt_ids) <= n else "prefix_mismatch")
+
+        self._prefix_cache_misses += 1
         input_ids = torch.tensor([prompt_ids], device=self.device)
         with torch.no_grad():
             out = self.model.generate(
@@ -190,6 +258,66 @@ class LocalHarmonyLLM(BasePipelineElement):
                 eos_token_id=STOP_TOKEN_IDS,
             )
         return out[0][len(prompt_ids):].tolist()
+
+    def _generate_from_cache(self, prompt_ids: List[int]) -> List[int]:
+        """Generate using the cached prefix KV state.
+
+        Strategy to restore the cache after generate() mutates it:
+        - Sliding-window layers: deepcopy before generate, restore after (~5ms for 3MB)
+        - Full-attention (global) layers: crop() back to prefix_len (O(1))
+
+        Uses _prefix_cache_ids_ref (the permanent reference) rather than
+        _prefix_cache_ids, which is cleared (disarmed) before this call.
+        """
+        import copy
+
+        prefix_len = len(self._prefix_cache_ids_ref)
+        suffix_ids = prompt_ids[prefix_len:]
+
+        # Snapshot just the sliding-window layers (tiny: 128 tokens × 8 heads per layer)
+        sliding_snapshots: Dict[int, Any] = {}
+        for i, layer in enumerate(self._prefix_cache_kv.layers):
+            if getattr(layer, "is_sliding", False):
+                sliding_snapshots[i] = copy.deepcopy(layer)
+
+        input_ids = torch.tensor([suffix_ids], device=self.device)
+        position_ids = torch.arange(
+            prefix_len, prefix_len + len(suffix_ids),
+            device=self.device, dtype=torch.long,
+        ).unsqueeze(0)
+        attention_mask = torch.ones(
+            1, prefix_len + len(suffix_ids),
+            device=self.device, dtype=torch.long,
+        )
+
+        with torch.no_grad():
+            out = self.model.generate(
+                input_ids=input_ids,
+                past_key_values=self._prefix_cache_kv,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                eos_token_id=STOP_TOKEN_IDS,
+            )
+
+        # Restore cache state so the next call starts from the same prefix.
+        for i, layer in enumerate(self._prefix_cache_kv.layers):
+            if i in sliding_snapshots:
+                # Restore sliding layer from snapshot (copy tensors to avoid aliasing)
+                snap = sliding_snapshots[i]
+                for attr in ("keys", "values"):
+                    val = getattr(snap, attr, None)
+                    setattr(layer, attr, val.clone() if isinstance(val, torch.Tensor) else val)
+                for attr in ("cumulative_length",):
+                    if hasattr(snap, attr):
+                        setattr(layer, attr, getattr(snap, attr))
+            else:
+                # Full-attention layer: crop back to prefix_len (O(1))
+                layer.crop(prefix_len)
+
+        # out[0] = [suffix_ids..., generated_ids...]
+        return out[0][len(suffix_ids):].tolist()
 
     def _generation_to_chat_message(self, gen) -> ChatAssistantMessage:
         """Convert HarmonyGeneration → AgentDojo ChatAssistantMessage."""

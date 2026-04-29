@@ -587,6 +587,20 @@ def decode_payload(tokenizer, token_ids: List[int]) -> str:
     return tokenizer.decode(token_ids, skip_special_tokens=True)
 
 
+def compute_prefix_kv_cache(model, prefix_ids: List[int], device: str):
+    """Run a single forward pass on prefix_ids and return past_key_values.
+
+    The returned object is stored (on CPU) in LocalHarmonyLLM.set_prefix_cache()
+    and reused across all perturbation runs in the same context to skip re-prefilling
+    the shared prompt prefix on every model.generate() call.
+    """
+    import torch as _torch
+    input_tensor = _torch.tensor([prefix_ids], device=device)
+    with _torch.no_grad():
+        out = model(input_ids=input_tensor, use_cache=True)
+    return out.past_key_values
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Cell-level: generate, filter, return surviving perturbations
 # ═══════════════════════════════════════════════════════════════════════
@@ -746,6 +760,11 @@ def profile_first_token_only(
     all_warnings = []
     t0 = time.time()
 
+    # Re-arm the prefix cache for this call (no-op if no cache is set).
+    # Safety guard: ensures this function can be called at any point in
+    # the pipeline flow without inheriting a stale disarmed state.
+    llm.rearm_prefix_cache()
+
     # ── Run full pipeline ───────────────────────────────────────────
     try:
         result = run_task(
@@ -759,19 +778,27 @@ def profile_first_token_only(
             "task_result": None,
             "warnings": [f"pipeline_failed: {e}"],
             "wall_time": time.time() - t0,
+            "t_pipeline": time.time() - t0,
+            "t_capture": 0.0,
             "error": str(e),
         }
 
+    t_pipeline = time.time() - t0
     result_warnings = check_task_result(result, run_label)
     all_warnings.extend(result_warnings)
 
     # ── Capture reasoning-entry attention ───────────────────────────
+    t_cap0 = time.time()
     tagging_payload = attack_payload_for_tagging or payload_string
     cap_result = capture_reasoning_entry_attention(
         llm.model, llm.formatter, result, llm.device, feature_config,
         attack_payload=tagging_payload,
         n_reasoning_tokens=n_reasoning_tokens,
     )
+    t_capture = time.time() - t_cap0
+
+    logger.info("  %s: t_pipeline=%.1fs  t_capture=%.1fs  total=%.1fs",
+                run_label, t_pipeline, t_capture, t_pipeline + t_capture)
 
     if cap_result is None:
         all_warnings.append(f"{run_label}: injection not found or no reasoning tokens")
@@ -782,7 +809,9 @@ def profile_first_token_only(
             "tagged": None,
             "reasoning_positions": [],
             "warnings": all_warnings,
-            "wall_time": time.time() - t0,
+            "wall_time": t_pipeline + t_capture,
+            "t_pipeline": t_pipeline,
+            "t_capture": t_capture,
         }
 
     cap, tagged, call_idx, reasoning_positions = cap_result
@@ -797,7 +826,9 @@ def profile_first_token_only(
         "tagged": tagged,
         "reasoning_positions": reasoning_positions,
         "warnings": all_warnings,
-        "wall_time": time.time() - t0,
+        "wall_time": t_pipeline + t_capture,
+        "t_pipeline": t_pipeline,
+        "t_capture": t_capture,
     }
 
 
@@ -834,6 +865,9 @@ def profile_single_run(
     """
     all_warnings = []
     t0 = time.time()
+
+    # Re-arm the prefix cache for this call (no-op if no cache is set).
+    llm.rearm_prefix_cache()
 
     # ── Run pipeline ────────────────────────────────────────────────
     try:
@@ -1276,6 +1310,23 @@ def run_failure_tree_experiment(
                 "injection_task_id": seed["injection_task_id"],
             }
 
+            # Set prefix KV cache for this seed's context so that each child's
+            # run_task() call can skip re-prefilling the shared prefix.
+            if bl is not None:
+                bl_spans_seed = bl.get("spans") or []
+                bl_tids_seed  = bl.get("token_ids") or []
+                payload_spans = [s for s in bl_spans_seed if s.get("tag") == "attack_payload"]
+                if payload_spans and bl_tids_seed:
+                    p_start = min(s["start"] for s in payload_spans)
+                    prefix_ids_seed = list(bl_tids_seed[:p_start])
+                    t_kv = time.time()
+                    kv = compute_prefix_kv_cache(llm.model, prefix_ids_seed, llm.device)
+                    llm.set_prefix_cache(prefix_ids_seed, kv)
+                    logger.debug("  Tree seed %d: prefix KV cache %d tokens, %.1fs",
+                                 seed_idx, p_start, time.time() - t_kv)
+            else:
+                llm.clear_prefix_cache()
+
             logger.info("  Level %d seed %d/%d  (N=%d  suite=%s/%s)",
                         level + 1, seed_idx + 1, len(current_seeds),
                         seed.get("N", "?"), seed["suite"], seed["injection_task_id"])
@@ -1306,6 +1357,9 @@ def run_failure_tree_experiment(
                         child_payload = decode_payload(llm.tokenizer, pert["perturbed_ids"])
 
                         # ── Run pipeline ─────────────────────────────────
+                        # Re-arm cache so only the first post-injection generate()
+                        # call in this run uses the prefix cache.
+                        llm.rearm_prefix_cache()
                         try:
                             result = run_task(
                                 pipeline, llm,
@@ -1417,6 +1471,7 @@ def run_failure_tree_experiment(
         logger.info("Tree level %d → %d: %d seeds selected (target_per_cell=%d)",
                     level + 1, level + 2, len(current_seeds), current_target_cell)
 
+    llm.clear_prefix_cache()
     logger.info("  Failure tree done: %d children (%d failures, %d successes)",
                 tree_summary["total_children"],
                 tree_summary["total_failures"],
@@ -1570,6 +1625,23 @@ def run_first_token_experiment(
         if not has_bl_capture:
             logger.warning("  Baseline capture missing — perturbation attention will not be recorded")
 
+        # ── Prefix KV cache ────────────────────────────────────────
+        # Compute and cache the KV state for the shared prompt prefix (everything
+        # before the attack_payload span).  This is reused in _generate() for all
+        # perturbation runs in this context, skipping 84% of prefill work each call.
+        if has_bl_capture:
+            payload_spans = [s for s in bl_spans if s.get("tag") == "attack_payload"]
+            if payload_spans:
+                payload_start = min(s["start"] for s in payload_spans)
+                prefix_ids = list(bl_token_ids[:payload_start])
+                t_kv = time.time()
+                kv = compute_prefix_kv_cache(llm.model, prefix_ids, llm.device)
+                llm.set_prefix_cache(prefix_ids, kv)
+                logger.info("  Prefix KV cache computed: %d tokens, %.1fs",
+                            payload_start, time.time() - t_kv)
+            else:
+                logger.warning("  No attack_payload span — prefix KV cache skipped")
+
         # ── Perturbation grid ──────────────────────────────────────
         for ptype in cfg["perturbation_types"]:
             for position in cfg["positions"]:
@@ -1603,6 +1675,9 @@ def run_first_token_experiment(
                         pert_t0 = time.time()
 
                         # ── Full pipeline run → outcome labels ──────────────
+                        # Re-arm the prefix cache for this run (single-use: only the
+                        # FIRST matching generate() call per run_task() uses the cache).
+                        llm.rearm_prefix_cache()
                         try:
                             pert_result = run_task(
                                 pipeline, llm,
@@ -1614,6 +1689,8 @@ def run_first_token_experiment(
                             logger.error("  %s: pipeline failed: %s", pert_label, e)
                             summary["total_warnings"] += 1
                             continue
+
+                        t_pert_pipeline = time.time() - pert_t0
 
                         pert_outcome = {
                             "success": pert_result.evaluation.get("injection_success"),
@@ -1636,6 +1713,7 @@ def run_first_token_experiment(
                         # Substitute perturbed payload tokens into the baseline
                         # token sequence and run one forward pass at the baseline
                         # reasoning positions.  No text matching needed.
+                        t_cap0 = time.time()
                         pert_cap_result = None
                         if has_bl_capture:
                             pert_cap_result = capture_perturbed_attention(
@@ -1651,6 +1729,10 @@ def run_first_token_experiment(
                             if pert_cap_result is None:
                                 logger.debug("  %s: capture_perturbed_attention returned None", pert_label)
                                 summary["total_warnings"] += 1
+                        t_pert_capture = time.time() - t_cap0
+                        logger.info("  %s: t_pipeline=%.1fs  t_capture=%.1fs  total=%.1fs",
+                                    pert_label, t_pert_pipeline, t_pert_capture,
+                                    t_pert_pipeline + t_pert_capture)
 
                         # Assemble pert_out dict compatible with _log_first_token_tensors.
                         # _log_first_token_tensors reads output["tagged"].spans, so we
@@ -1730,6 +1812,7 @@ def run_first_token_experiment(
         input_summary["wall_time"] = time.time() - input_t0
         summary["input_summaries"].append(input_summary)
         logger.info("  Input %d done in %.1fs", input_idx + 1, input_summary["wall_time"])
+        llm.clear_prefix_cache()
 
     # ── Failure tree ───────────────────────────────────────────────────
     if cfg.get("failure_tree_n_roots", 0) > 0:
