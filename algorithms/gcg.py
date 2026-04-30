@@ -127,6 +127,7 @@ def custom_gcg(
     signal_kwargs = custom_gcg_hyperparams.get("signal_kwargs", None)
     true_loss_kwargs = custom_gcg_hyperparams.get("true_loss_kwargs", None)
     trajectory_metrics_fn = custom_gcg_hyperparams.get("trajectory_metrics_fn", None)
+    trajectory_metrics_interval = custom_gcg_hyperparams.get("trajectory_metrics_interval", 1)
 
     current_best_tokens = input_tokens.clone()
     best_output_sequences = []
@@ -218,7 +219,7 @@ def custom_gcg(
         logprobs = logprobs.item()
         logprobs_chunk.append(logprobs)
         logprobs_sequences.append(logprobs)
-        if trajectory_metrics_fn is not None:
+        if trajectory_metrics_fn is not None and step_num % trajectory_metrics_interval == 0:
             trajectory_metrics_chunk.append(
                 trajectory_metrics_fn(model, tokenizer, current_best_tokens, masks_data, logger)
             )
@@ -388,6 +389,7 @@ def weakly_universal_gcg(
     true_loss_kwargs = universal_gcg_hyperparameters.get("true_loss_kwargs", None)
     randomness_strategy = universal_gcg_hyperparameters.get("randomness_strategy", DEFAULT_GCG_RANDOMNESS_STRATEGY)
     trajectory_metrics_fn = universal_gcg_hyperparameters.get("trajectory_metrics_fn", None)
+    trajectory_metrics_interval = universal_gcg_hyperparameters.get("trajectory_metrics_interval", 1)
 
     on_step_begin = universal_gcg_hyperparameters.get("on_step_begin", DEFAULT_ON_STEP)
     on_step_begin_kwargs = universal_gcg_hyperparameters.get("on_step_begin_kwargs", {})
@@ -440,7 +442,7 @@ def weakly_universal_gcg(
         logprobs_chunk.append(average_logprobs.item())
         average_logprobs_list.append(average_logprobs.item())
         current_input_tokenized_data_list = attack_utility.update_all_tokens(best_tokens_dict, current_input_tokenized_data_list)
-        if trajectory_metrics_fn is not None:
+        if trajectory_metrics_fn is not None and step_num % trajectory_metrics_interval == 0:
             # Use first context as representative; models[0] for the forward pass
             rep = current_input_tokenized_data_list[0]
             trajectory_metrics_chunk.append(

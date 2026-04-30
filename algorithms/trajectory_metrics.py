@@ -51,13 +51,18 @@ def compute_trajectory_metrics(
         attn_to_payload = true_attentions[:, :, :, :, payload_mask]
         # (n_layers, 1, n_heads, n_target, n_payload)
 
-        # Uniform: sum over all dims
+        # Uniform scalar: sum over all dims
         payload_attn_uniform = attn_to_payload.sum().item()
 
-        # Sensitivity-weighted: available once Phase-1 signal_function has run once
+        # Per-head signature: (n_layers, n_heads) — sum out batch/target/payload dims.
+        # Free to compute since attn_to_payload is already sliced.
+        # Lets us cross-reference with causal-spark / profiler head rankings later.
+        head_payload_attn = attn_to_payload.sum(dim=(1, 3, 4)).cpu().numpy()
+        # shape: (n_layers, n_heads) — ~1 KB for 32-layer models, trivial to store
+
+        # Sensitivity-weighted scalar: available once Phase-1 signal_function has run
         if losses_experimental.CLIPPED_CACHED_DOLLY_LAYER_WEIGHT_OBJ is not None:
-            # CLIPPED_CACHED shape: (n_layers, n_heads)
-            # Broadcast to (n_layers, 1, n_heads, 1, 1)
+            # CLIPPED_CACHED shape: (n_layers, n_heads) — broadcast to (n_layers, 1, n_heads, 1, 1)
             w = (
                 losses_experimental.CLIPPED_CACHED_DOLLY_LAYER_WEIGHT_OBJ
                 .to(attn_to_payload.device)
@@ -65,8 +70,7 @@ def compute_trajectory_metrics(
             )
             payload_attn_weighted = (attn_to_payload * w).sum().item()
 
-        # First target token logprob from the same logit tensor
-        # logits: (1, seq_len, vocab_size)
+        # First target token logprob from the same logit tensor.
         # position -(len(target_mask)+1) predicts target_mask[0] — same convention as target_logprobs
         first_pred_logits = logits[0, -(len(target_mask) + 1), :].float()
         log_probs = torch.nn.functional.log_softmax(first_pred_logits, dim=-1)
@@ -77,5 +81,6 @@ def compute_trajectory_metrics(
     return {
         "payload_attn_uniform": payload_attn_uniform,
         "payload_attn_weighted": payload_attn_weighted,
+        "head_payload_attn": head_payload_attn,   # (n_layers, n_heads) numpy array
         "first_token_logprob": first_token_logprob,
     }
